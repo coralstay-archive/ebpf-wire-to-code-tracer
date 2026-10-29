@@ -1,0 +1,14 @@
+# Reference materials (large PDFs, kernel source trees, external docs)
+/references/
+
+# Python & C/BPF build artifacts
+__pycache__/
+*.py[cod]
+*.o
+*.so
+.ruff_cache/
+.pytest_cache/
+
+# macOS
+.DS_Store
+._*
