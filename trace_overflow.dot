@@ -1,0 +1,70 @@
+digraph eBPF_WireToCode_Topology {
+    rankdir=TB;
+    compound=true;
+    fontname="Inter,Helvetica,Arial,sans-serif";
+    node [shape=box, style="rounded,filled", fontname="Inter,Helvetica,Arial,sans-serif", fontsize=10, margin="0.18,0.10"];
+    edge [fontname="Inter,Helvetica,Arial,sans-serif", fontsize=9];
+    subgraph cluster_alert_overflow {
+        style="rounded,filled";
+        fillcolor="#ffebee";
+        color="#c0392b";
+        penwidth=3;
+        label="⚠️ WARNING: BPF RING BUFFER OVERFLOW DETECTED (Dropped Events: 128)";
+        fontcolor="#c0392b";
+        fontsize=12;
+        alert_node [label="BPF RingBuf Overflow: 128 events dropped\nIncrease ringbuf pages or enable --focus-symbol", fillcolor="#ffebee", color="#c0392b", fontcolor="#c0392b", penwidth=2.5];
+    }
+    subgraph cluster_tier_ingress {
+        label="[TIER 1: INGRESS WIRE (OSI L2 NIC / XDP)]";
+        style="rounded,filled"; fillcolor="#f8f9fa"; color="#34495e";
+            hop_1 [label="[L2_DATALINK] xdp_ingress_filter\nModule: kernel:lo | TID: 0\nDuration: 0.042 ms (0.1% of RTT)", color="#2ecc71", fillcolor="#eafaf1", penwidth=1.5];
+    }
+    subgraph cluster_tier_kernel {
+        label="[TIER 2: LINUX KERNEL NETWORK, MEMORY & PRE-COMPUTE SCHEDULER STACK (L3 -> L4 -> Socket -> L5 -> L6)]";
+        style="rounded,filled"; fillcolor="#f4f6f7"; color="#2c3e50";
+            hop_2 [label="[L3_NETWORK_IP] kprobe:ip_rcv\nModule: kernel:ipv4 | TID: 0\nDuration: 0.038 ms (0.1% of RTT)", color="#2ecc71", fillcolor="#eafaf1", penwidth=1.5];
+            hop_3 [label="[L4_TRANSPORT_TCP] kprobe:tcp_v4_rcv\nModule: kernel:tcp | TID: 0\nDuration: 0.065 ms (0.2% of RTT)", color="#2ecc71", fillcolor="#eafaf1", penwidth=1.5];
+            hop_4 [label="[L4_5_SOCKET_QUEUE] kprobe/kretprobe:tcp_recvmsg\nModule: kernel:socket | TID: 10420\nDuration: 0.195 ms (0.7% of RTT)", color="#2ecc71", fillcolor="#eafaf1", penwidth=1.5];
+            hop_5 [label="[L5_SYSCALL_MEM] skb_copy_datagram_iovec+kretprobe\nModule: kernel:mm_skb | TID: 10420\nDuration: 0.025 ms (0.1% of RTT)", color="#2ecc71", fillcolor="#eafaf1", penwidth=1.5];
+            hop_6 [label="[L6_PRE_COMPUTE_GATE] sched_waking+sched_wakeup+sched_switch\nModule: kernel:sched | TID: 10425\nDuration: 0.180 ms (0.7% of RTT)", color="#2ecc71", fillcolor="#eafaf1", penwidth=1.5];
+    }
+    subgraph cluster_tier_app {
+        label="[TIER 3: USER-SPACE APPLICATION & WORKER THREAD POOL (OSI L7 ALU)]";
+        style="rounded,filled"; fillcolor="#fdfefe"; color="#1f618d";
+        subgraph cluster_mod_mock_server {
+            label="Module: mock_server";
+            style="rounded,dashed"; color="#5d6d7e";
+            hop_7 [label="[L7_COMPUTE_ALU] parse_http_request\nModule: mock_server | TID: 10420\nDuration: 0.420 ms (1.6% of RTT)", color="#2ecc71", fillcolor="#eafaf1", penwidth=1.5];
+            hop_8 [label="[L7_COMPUTE_ALU] validate_auth_header\nModule: mock_server | TID: 10420\nDuration: 0.680 ms (2.5% of RTT)", color="#2ecc71", fillcolor="#eafaf1", penwidth=1.5];
+            hop_10 [label="[L7_COMPUTE_ALU] execute_storage_query\nModule: mock_server | TID: 10425\nDuration: 21.525 ms (79.3% of RTT)", color="#e74c3c", fillcolor="#fdedec", penwidth=2.8];
+            hop_11 [label="[L7_COMPUTE_ALU] format_http_response\nModule: mock_server | TID: 10425\nDuration: 0.280 ms (1.0% of RTT)", color="#2ecc71", fillcolor="#eafaf1", penwidth=1.5];
+        }
+        subgraph cluster_mod_libcrypto_mock_so {
+            label="Module: libcrypto_mock.so (Stripped)";
+            style="rounded,dashed"; color="#8e44ad";
+            hop_9 [label="[L7_COMPUTE_ALU] libcrypto_mock.so+0x538\n[STRIPPED ELF OFFSET]\nModule: libcrypto_mock.so | TID: 10420\nDuration: 3.450 ms (12.7% of RTT)", color="#8e44ad", fillcolor="#fef9e7", penwidth=2.0];
+        }
+    }
+    subgraph cluster_tier_egress {
+        label="[TIER 4: EGRESS WIRE (Socket -> L4/L3 IP -> L2 NIC Qdisc/TX)]";
+        style="rounded,filled"; fillcolor="#f8f9fa"; color="#34495e";
+            hop_12 [label="[L4_5_SOCKET_QUEUE] kprobe:tcp_sendmsg\nModule: kernel:socket | TID: 10425\nDuration: 0.066 ms (0.2% of RTT)", color="#2ecc71", fillcolor="#eafaf1", penwidth=1.5];
+            hop_13 [label="[L4_TRANSPORT_TCP] kprobe:__tcp_transmit_skb\nModule: kernel:tcp | TID: 10425\nDuration: 0.040 ms (0.1% of RTT)", color="#2ecc71", fillcolor="#eafaf1", penwidth=1.5];
+            hop_14 [label="[L3_NETWORK_IP] kprobe:ip_output\nModule: kernel:ipv4 | TID: 10425\nDuration: 0.032 ms (0.1% of RTT)", color="#2ecc71", fillcolor="#eafaf1", penwidth=1.5];
+            hop_15 [label="[L2_DATALINK] tracepoint:net:net_dev_xmit\nModule: kernel:lo | TID: 10425\nDuration: 0.070 ms (0.3% of RTT)", color="#2ecc71", fillcolor="#eafaf1", penwidth=1.5];
+    }
+    hop_1 -> hop_2 [color="#2ecc71", penwidth=1.5, label="+0.038 ms"];
+    hop_2 -> hop_3 [color="#2ecc71", penwidth=1.5, label="+0.065 ms"];
+    hop_3 -> hop_4 [color="#2ecc71", penwidth=1.5, label="+0.195 ms"];
+    hop_4 -> hop_5 [color="#2ecc71", penwidth=1.5, label="+0.025 ms"];
+    hop_5 -> hop_6 [color="#2980b9", style="dashed,bold", penwidth=2.4, label="Thread Handoff (TID 10420 -> TID 10425) | +0.180 ms"];
+    hop_6 -> hop_7 [color="#2ecc71", penwidth=1.5, label="+0.420 ms"];
+    hop_7 -> hop_8 [color="#2ecc71", penwidth=1.5, label="+0.680 ms"];
+    hop_8 -> hop_9 [color="#f39c12", penwidth=2.0, label="+3.450 ms"];
+    hop_9 -> hop_10 [color="#2980b9", style="dashed,bold", penwidth=2.4, label="Thread Handoff (TID 10420 -> TID 10425) | +21.525 ms"];
+    hop_10 -> hop_11 [color="#2ecc71", penwidth=1.5, label="+0.280 ms"];
+    hop_11 -> hop_12 [color="#2ecc71", penwidth=1.5, label="+0.066 ms"];
+    hop_12 -> hop_13 [color="#2ecc71", penwidth=1.5, label="+0.040 ms"];
+    hop_13 -> hop_14 [color="#2ecc71", penwidth=1.5, label="+0.032 ms"];
+    hop_14 -> hop_15 [color="#2ecc71", penwidth=1.5, label="+0.070 ms"];
+}
