@@ -1631,7 +1631,12 @@ int kprobe____tcp_transmit_skb(struct pt_regs *ctx, struct sock *sk, struct sk_b
 
 int kprobe__ip_output(struct pt_regs *ctx, struct net *net, struct sock *sk, struct sk_buff *skb)
 {
-    /* Per net/ipv4/ip_output.c:426, skb is PT_REGS_PARM3(ctx) and sk is PT_REGS_PARM2(ctx) */
+    /*
+     * Per net/ipv4/ip_output.c:426 & net/ipv4/tcp_output.c:1267, __tcp_transmit_skb
+     * clones oskb (skb = skb_clone(oskb, gfp_mask)), so skb at ip_output is a post-clone
+     * pointer! Resolve via PT_REGS_PARM2(ctx) (struct sock *sk) and register the post-clone
+     * skb_ptr into skb_egress_map so net_dev_queue and net_dev_xmit match it!
+     */
     u64 skb_ptr = (u64)PT_REGS_PARM3(ctx);
     struct flow_key_t fallback_key = {};
     struct flow_key_t *ekey = skb_egress_map.lookup(&skb_ptr);
@@ -1644,6 +1649,7 @@ int kprobe__ip_output(struct pt_regs *ctx, struct net *net, struct sock *sk, str
         if (target_port != 0 && fallback_key.sport != target_port)
             return 0;
         ekey = &fallback_key;
+        skb_egress_map.update(&skb_ptr, ekey);
     }
 
     struct flow_state_t *estate = egress_flow_map.lookup(ekey);
@@ -1729,11 +1735,27 @@ int kprobe__ipv6_rcv(struct pt_regs *ctx, struct sk_buff *skb)
 
     struct ipv6hdr ip6h = {};
     bpf_probe_read_kernel(&ip6h, sizeof(ip6h), head + net_off);
-    if (ip6h.nexthdr != IPPROTO_TCP && ip6h.nexthdr != IPPROTO_UDP)
+
+    /* At ipv6_rcv entry (ip6_input.c:302), unroll up to 2 IPv6 extension headers (0, 43, 44, 60) */
+    u8 nexthdr = ip6h.nexthdr;
+    u16 trans_off = net_off + sizeof(struct ipv6hdr);
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        if (nexthdr == 0 || nexthdr == 43 || nexthdr == 60) {
+            u8 ext_hdr[2] = {};
+            bpf_probe_read_kernel(ext_hdr, sizeof(ext_hdr), head + trans_off);
+            nexthdr = ext_hdr[0];
+            trans_off += (u16)(ext_hdr[1] + 1) * 8;
+        } else if (nexthdr == 44) {
+            u8 frag_hdr[2] = {};
+            bpf_probe_read_kernel(frag_hdr, sizeof(frag_hdr), head + trans_off);
+            nexthdr = frag_hdr[0];
+            trans_off += 8;
+        }
+    }
+    if (nexthdr != IPPROTO_TCP && nexthdr != IPPROTO_UDP)
         return 0;
 
-    /* At ipv6_rcv entry (ip6_input.c:302), trans_off = net_off + sizeof(struct ipv6hdr) (40B) */
-    u16 trans_off = net_off + sizeof(struct ipv6hdr);
     u16 ports[2] = {};
     bpf_probe_read_kernel(ports, sizeof(ports), head + trans_off);
     u16 sport = bpf_ntohs(ports[0]);
@@ -1747,7 +1769,7 @@ int kprobe__ipv6_rcv(struct pt_regs *ctx, struct sk_buff *skb)
     key.daddr  = fold_ipv6_addr32(ip6h.daddr.in6_u.u6_addr32);
     key.sport  = sport;
     key.dport  = dport;
-    key.proto  = ip6h.nexthdr;
+    key.proto  = nexthdr;
     key.family = AF_INET6;
 
     u64 now = bpf_ktime_get_ns();
@@ -1768,9 +1790,19 @@ int kprobe__ipv6_rcv(struct pt_regs *ctx, struct sk_buff *skb)
 int kprobe__ip6_output(struct pt_regs *ctx, struct net *net, struct sock *sk, struct sk_buff *skb)
 {
     u64 skb_ptr = (u64)PT_REGS_PARM3(ctx);
+    struct flow_key_t fallback_key = {};
     struct flow_key_t *ekey = skb_egress_map.lookup(&skb_ptr);
-    if (!ekey)
-        return 0;
+    if (!ekey) {
+        struct sock *sk_arg = (struct sock *)PT_REGS_PARM2(ctx);
+        if (!sk_arg)
+            return 0;
+        populate_sock_flow_key(sk_arg, &fallback_key, IPPROTO_TCP, 1);
+        u16 target_port = get_target_port();
+        if (target_port != 0 && fallback_key.sport != target_port)
+            return 0;
+        ekey = &fallback_key;
+        skb_egress_map.update(&skb_ptr, ekey);
+    }
 
     struct flow_state_t *estate = egress_flow_map.lookup(ekey);
     if (!estate)
@@ -1824,11 +1856,26 @@ int kprobe__tcp_v6_rcv(struct pt_regs *ctx, struct sk_buff *skb)
     key.family = AF_INET6;
 
     u64 now = bpf_ktime_get_ns();
-    struct flow_state_t *state = ingress_flow_map.lookup(&key);
-    if (!state)
-        return 0;
-
     u8 tflags = extract_tcp_flags(&tcph);
+    u16 payload_len = bpf_ntohs(ip6h.payload_len);
+    u16 doff_len = (tcph.doff & 0x0f) * 4;
+    u16 tcp_payload_len = (payload_len > doff_len) ? (payload_len - doff_len) : 0;
+
+    struct flow_state_t *state = ingress_flow_map.lookup(&key);
+    if (!state || (state->consumed == 1 && tcp_payload_len > 0)) {
+        struct flow_state_t init_state = {};
+        init_state.req_id    = ((now & 0xFFFFFFFFULL) << 16) ^ ((u64)sport << 4) ^ (u64)dport;
+        init_state.ip_rcv_ts = state ? state->ip_rcv_ts : now;
+        init_state.pkt_len   = payload_len + 40;
+        init_state.tcp_flags = tflags;
+        init_state.rx_cpu_id = (u8)bpf_get_smp_processor_id();
+        init_state.consumed  = 0;
+        ingress_flow_map.update(&key, &init_state);
+        state = ingress_flow_map.lookup(&key);
+        if (!state)
+            return 0;
+    }
+
     state->tcp_rcv_ts = now;
     state->tcp_flags  = tflags;
     u64 dur_ns = state->ip_rcv_ts ? (now - state->ip_rcv_ts) : 30000ULL;
@@ -2042,6 +2089,14 @@ int kprobe__udp_sendmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr *msg
         egress_key.sport = tctx->dport;
 
     u64 now = bpf_ktime_get_ns();
+    struct flow_state_t estate = {};
+    estate.req_id     = tctx->req_id;
+    estate.sendmsg_ts = now;
+    estate.pid        = tgid;
+    estate.tid        = tid;
+    estate.pkt_len    = (u16)len;
+    egress_flow_map.update(&egress_key, &estate);
+
     emit_kray_event(
         tctx->req_id, (u64)len, now, 20000ULL,
         tgid, tid, tctx->parent_tid,
@@ -2152,6 +2207,23 @@ int kprobe__unix_stream_recvmsg(struct pt_regs *ctx, struct socket *sock)
         u32 tgid = (u32)(pid_tgid >> 32);
         u32 tid  = (u32)pid_tgid;
         u64 now  = bpf_ktime_get_ns();
+        state->consumed = 1;
+
+        u32 zero_idx = 0;
+        struct tid_ctx_t *zero_template = zero_ctx_map.lookup(&zero_idx);
+        if (zero_template) {
+            active_ctx_map.update(&tid, zero_template);
+            struct tid_ctx_t *tctx = active_ctx_map.lookup(&tid);
+            if (tctx) {
+                tctx->req_id        = state->req_id;
+                tctx->last_stage_ts = now;
+                tctx->pid           = tgid;
+                tctx->tid           = tid;
+                tctx->saddr         = key.saddr;
+                tctx->daddr         = key.daddr;
+            }
+        }
+
         emit_kray_event(
             state->req_id, (u64)state->pkt_len, now, now - state->sendmsg_ts,
             tgid, tid, 0,
@@ -2188,8 +2260,11 @@ int kprobe__unix_stream_sendmsg(struct pt_regs *ctx, struct socket *sock)
     key.family = AF_UNIX;
 
     u64 now = bpf_ktime_get_ns();
+    u32 tid = (u32)bpf_get_current_pid_tgid();
+    struct tid_ctx_t *tctx = active_ctx_map.lookup(&tid);
+
     struct flow_state_t state = {};
-    state.req_id     = ((now & 0xFFFFFFFFULL) << 16) ^ (u64)key.saddr;
+    state.req_id     = (tctx && tctx->req_id != 0) ? tctx->req_id : (((now & 0xFFFFFFFFULL) << 16) ^ (u64)key.saddr);
     state.sendmsg_ts = now;
     state.pkt_len    = 128;
     ingress_flow_map.update(&key, &state);
