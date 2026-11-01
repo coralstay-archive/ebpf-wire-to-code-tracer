@@ -281,8 +281,6 @@ static void build_ipv4_tcp_buf(
 
     u16 net_off = sizeof(struct ethhdr);
     struct iphdr *iph = (struct iphdr *)(buf + net_off);
-    if (ihl_words < 5)
-        ihl_words = 5;
     u16 ihl_bytes = (u16)(ihl_words * 4);
     u16 tcp_bytes = sizeof(struct tcphdr);
     u16 ip_tot    = ihl_bytes + tcp_bytes + payload_len;
@@ -509,30 +507,25 @@ int sim_tcp_egress_pipeline(
     struct pt_regs regs = {};
     kprobe__tcp_sendmsg(&regs, &sk, &msg, payload_size);
 
-    struct sk_buff skb = {};
-    regs.regs[0] = (u64)(uintptr_t)&sk;
-    regs.regs[1] = (u64)(uintptr_t)&skb;
+    struct sk_buff oskb = {};
+    struct sk_buff cloned_skb = {};
+    struct sk_buff *post_clone_skb = test_ip_output_parm2_fallback ? &cloned_skb : &oskb;
 
-    if (!test_ip_output_parm2_fallback) {
-        kprobe____tcp_transmit_skb(&regs, &sk, &skb);
-    }
+    regs.regs[0] = (u64)(uintptr_t)&sk;
+    regs.regs[1] = (u64)(uintptr_t)&oskb;
+    kprobe____tcp_transmit_skb(&regs, &sk, &oskb);
 
     struct net dummy_net = {};
     struct pt_regs ip_regs = {};
     ip_regs.regs[0] = (u64)(uintptr_t)&dummy_net;
     ip_regs.regs[1] = (u64)(uintptr_t)&sk;
-    ip_regs.regs[2] = (u64)(uintptr_t)&skb;
-    kprobe__ip_output(&ip_regs, &dummy_net, &sk, &skb);
+    ip_regs.regs[2] = (u64)(uintptr_t)post_clone_skb;
+    kprobe__ip_output(&ip_regs, &dummy_net, &sk, post_clone_skb);
 
-    if (test_ip_output_parm2_fallback) {
-        /* Populate skb_egress_map so net_dev_queue/xmit can complete */
-        kprobe____tcp_transmit_skb(&regs, &sk, &skb);
-    }
-
-    tp_args_net_net_dev_queue_t q_args = { .skbaddr = &skb, .len = payload_size };
+    tp_args_net_net_dev_queue_t q_args = { .skbaddr = post_clone_skb, .len = payload_size };
     tracepoint__net__net_dev_queue(&q_args);
 
-    tp_args_net_net_dev_xmit_t x_args = { .skbaddr = &skb, .len = payload_size, .rc = 0 };
+    tp_args_net_net_dev_xmit_t x_args = { .skbaddr = post_clone_skb, .len = payload_size, .rc = 0 };
     tracepoint__net__net_dev_xmit(&x_args);
 
     kretprobe__tcp_sendmsg(&regs);
@@ -900,7 +893,7 @@ int sim_ipv6_tcp_pipeline(const u32 saddr6[4], const u32 daddr6[4], u16 sport, u
     ip6h->version     = 6;
     ip6h->nexthdr     = IPPROTO_TCP;
     ip6h->hop_limit   = 64;
-    ip6h->payload_len = bpf_htons(sizeof(struct tcphdr) + payload_len);
+    ip6h->payload_len = bpf_htons(payload_len > 40 ? (payload_len - 40) : payload_len);
     memcpy(ip6h->saddr.in6_u.u6_addr32, saddr6, 16);
     memcpy(ip6h->daddr.in6_u.u6_addr32, daddr6, 16);
 
@@ -1008,6 +1001,26 @@ int sim_dual_stack_sock_key_test(u32 rem_ip4, u32 loc_ip4, u16 rem_port, u16 loc
     return 0;
 }
 
+int sim_pure_ipv6_loopback4_sock_key_test(
+    const u32 rem6[4], const u32 loc6[4], u16 rem_port, u16 loc_port, struct flow_key_t *out_key)
+{
+    struct sock sk = {};
+    sk.__sk_common.skc_family    = AF_INET6;
+    /* Rocky 9.8 tcp_v6_syn_recv_sock (net/ipv6/tcp_ipv6.c:1356) sets LOOPBACK4_IPV6 (htonl(0x7f000006)) */
+    sk.__sk_common.skc_daddr     = bpf_htonl(0x7f000006);
+    sk.__sk_common.skc_rcv_saddr = bpf_htonl(0x7f000006);
+    sk.__sk_common.skc_dport     = bpf_htons(rem_port);
+    sk.__sk_common.skc_num       = loc_port;
+    memcpy(sk.__sk_common.skc_v6_daddr.in6_u.u6_addr32, rem6, 16);
+    memcpy(sk.__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32, loc6, 16);
+
+    if (out_key) {
+        memset(out_key, 0, sizeof(*out_key));
+        populate_sock_flow_key(&sk, out_key, IPPROTO_TCP, 0);
+    }
+    return 0;
+}
+
 int sim_publish_handoff_burst(u32 tgid, u64 req_id, u32 waker_tid, u16 sport, u16 dport, u8 cpu_id)
 {
     u64 now = bpf_ktime_get_ns();
@@ -1020,4 +1033,15 @@ int sim_claim_handoff_via_futex_exit(u32 tgid, u32 worker_tid, u8 cpu_id)
     sim_set_context(tgid, worker_tid, cpu_id);
     tp_args_syscalls_sys_exit_futex_t args = { .id = 98, .ret = 0 };
     return tracepoint__syscalls__sys_exit_futex(&args);
+}
+
+int sim_epoll_pwait_cycle(u32 tgid, u32 tid, int ret, u64 wait_ns)
+{
+    sim_set_context(tgid, tid, 0);
+    tp_args_syscalls_sys_enter_epoll_pwait_t enter_args = { .id = 22 };
+    tracepoint__syscalls__sys_enter_epoll_pwait(&enter_args);
+    if (wait_ns > 0)
+        g_sim_clock_ns += wait_ns;
+    tp_args_syscalls_sys_exit_epoll_pwait_t exit_args = { .id = 22, .ret = ret };
+    return tracepoint__syscalls__sys_exit_epoll_pwait(&exit_args);
 }

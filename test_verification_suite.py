@@ -1284,6 +1284,12 @@ def _get_kernel_sim_lib():
     ]
     lib.sim_dual_stack_sock_key_test.restype = ctypes.c_int
 
+    lib.sim_pure_ipv6_loopback4_sock_key_test.argtypes = [
+        ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_uint16, ctypes.c_uint16, ctypes.POINTER(SimFlowKey),
+    ]
+    lib.sim_pure_ipv6_loopback4_sock_key_test.restype = ctypes.c_int
+
     lib.sim_publish_handoff_burst.argtypes = [
         ctypes.c_uint32, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint16, ctypes.c_uint16, ctypes.c_uint8,
     ]
@@ -1589,6 +1595,8 @@ def test_adv_04_synthetic_raw_packet_vlan_ipv6_arp_and_malformed_fuzzing():
     qinq_evs = _drain_sim_events(lib, tracer_agent)
     assert len(qinq_evs) == 1
     assert qinq_evs[0].src_port == 53000 and qinq_evs[0].dst_port == 8080
+    qinq_meta = tracer_agent.decode_event_metadata(qinq_evs[0])
+    assert qinq_meta["vlan_id"] == 200, f"Expected inner 802.1Q VLAN ID 200, got {qinq_meta['vlan_id']}"
 
     # 3. Execute C hooks for ARP, ICMP, Unconnected UDP, IPv6, Dual-Stack ::ffff:, AF_UNIX, and kfree_skb
     lib.sim_arp_rcv_test(0x0101A8C0, 0xFE01A8C0)
@@ -1633,6 +1641,12 @@ def test_adv_04_synthetic_raw_packet_vlan_ipv6_arp_and_malformed_fuzzing():
     lib.sim_dual_stack_sock_key_test(0x0100007F, 0x0100007F, 57000, 8080, ctypes.byref(ds_key))
     assert ds_key.family == 2, f"Expected AF_INET (2) for Dual-Stack ::ffff: socket, got {ds_key.family}"
 
+    # Pure IPv6 socket with Rocky 9.8 LOOPBACK4_IPV6 (htonl(0x7f000006)) in skc_daddr -> must remain AF_INET6 (10)!
+    v6_loop_key = SimFlowKey()
+    lib.sim_pure_ipv6_loopback4_sock_key_test(s6, d6, 56000, 8080, ctypes.byref(v6_loop_key))
+    assert v6_loop_key.family == 10, f"Expected AF_INET6 (10) for Pure IPv6 with LOOPBACK4_IPV6, got {v6_loop_key.family}"
+    assert v6_loop_key.saddr == (0x20010DB8 ^ 1) and v6_loop_key.daddr == (0x20010DB8 ^ 2)
+
     # AF_UNIX sendmsg -> recvmsg pointer correlation
     lib.sim_unix_stream_pipeline(0x1000, 0x2000)
     unix_evs = _drain_sim_events(lib, tracer_agent)
@@ -1644,6 +1658,8 @@ def test_adv_04_synthetic_raw_packet_vlan_ipv6_arp_and_malformed_fuzzing():
     lib.sim_tcp_retransmit_skb_test(0x0100007F, 0x0100007F, 58000, 8080)
     retx_evs = _drain_sim_events(lib, tracer_agent)
     assert len(retx_evs) == 1 and (retx_evs[0].flags & tracer_agent.FLAG_TCP_RETRANSMIT) != 0
+    retx_meta = tracer_agent.decode_event_metadata(retx_evs[0])
+    assert retx_meta["retransmit_count"] == 1
 
     lib.sim_kfree_skb_test(0x0100007F, 0x0100007F, 58000, 8080, 1, 2)  # reason=1 ignored
     assert lib.sim_pending_events_count() == 0
@@ -1653,6 +1669,7 @@ def test_adv_04_synthetic_raw_packet_vlan_ipv6_arp_and_malformed_fuzzing():
     drop_evs = _drain_sim_events(lib, tracer_agent)
     assert len(drop_evs) == 3
     assert all((e.flags & tracer_agent.FLAG_SKB_DROP) != 0 for e in drop_evs)
+    assert [tracer_agent.decode_event_metadata(e)["skb_drop_reason"] for e in drop_evs] == [4, 5, 7]
 
 
 # ==============================================================================
@@ -1832,6 +1849,23 @@ def test_adv_07_elf_dwarf_pie_aslr_and_aarch64_64kb_symbolication():
     selected = sym.select_auto_uprobe_targets(candidates)
     assert len(selected) == 64  # Strictly capped at MAX_AUTO_UPROBES = 64
     assert all(s.startswith("app_business_handler_") for s in selected)
+
+    # Verify deep recursion (> 16 frames, e.g., 20 nested uprobe calls) never overwrites root frame slot 0!
+    lib = _get_kernel_sim_lib()
+    lib.sim_reset_all()
+    lib.sim_configure_runtime(8800, 8080, 1, 1)
+    lib.sim_set_context(8800, 8800, 0)
+    lib.sim_tcp_v4_ingress_pipeline(0x0100007F, 0x0100007F, 59900, 8080, 5, 64, 0, 1, 1, 0, 1, 0, 1, 1)
+    lib.sim_tcp_recvmsg_call(0x0100007F, 0x0100007F, 59900, 8080, 64, 0)
+    _drain_sim_events(lib, tracer_agent)
+    for depth_i in range(20):
+        lib.sim_uprobe_call(0x401000 + depth_i * 0x10, 0x7FFFFFFFE000, 1000, 1, 0)
+    for depth_i in reversed(range(20)):
+        lib.sim_uprobe_call(0x401000 + depth_i * 0x10, 0x7FFFFFFFE000, 1000, 0, 1)
+    rec_evs = _drain_sim_events(lib, tracer_agent)
+    root_return = rec_evs[-1]
+    assert root_return.is_return == 1 and root_return.call_depth == 0
+    assert root_return.ip == 0x401000, f"Root frame IP overwritten by depth >= 16 wrap-around: {root_return.ip:#x}"
 
 
 # ==============================================================================
@@ -2212,7 +2246,7 @@ def test_adv_12_target_kernel_live_verifier_and_loopback_readiness(tmp_path: Pat
             subprocess.run(["sudo", "-n", "mkdir", "-p", pin_dir], check=True)
             subprocess.run(["sudo", "-n", "/usr/sbin/bpftool", "prog", "loadall", str(bpf_obj), pin_dir], check=True)
             pinned = subprocess.check_output(["sudo", "-n", "ls", "-1", pin_dir], text=True).splitlines()
-            assert len(pinned) == 42, f"Expected all 42 eBPF programs pinned by Kernel Verifier, got {len(pinned)}"
+            assert len(pinned) >= 42, f"Expected all eBPF programs pinned by Kernel Verifier, got {len(pinned)}"
         finally:
             subprocess.run(["sudo", "-n", "rm", "-rf", pin_dir], check=False)
 

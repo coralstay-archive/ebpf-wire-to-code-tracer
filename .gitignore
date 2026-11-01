@@ -24,3 +24,7 @@ mock_server
 .opensource/
 *.pdf
 *.epub
+
+# BPF 빌드 산출물 (make로 다시 생성)
+*.bpf.o
+*.skel.h

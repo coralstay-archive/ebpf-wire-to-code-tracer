@@ -170,6 +170,7 @@ struct sk_buff {
     u16 network_header;
     u16 transport_header;
     u16 protocol;
+    u16 vlan_tci;
     u32 len;
 };
 
@@ -244,11 +245,15 @@ typedef struct {
     int   reason;
 } tp_args_skb_kfree_skb_t;
 typedef struct { const void *skbaddr; int len; } tp_args_skb_skb_copy_datagram_iovec_t;
-typedef struct { int nr; unsigned long op; unsigned long args[6]; } tp_args_syscalls_sys_enter_read_t;
-typedef struct { int nr; unsigned long op; unsigned long args[6]; } tp_args_syscalls_sys_enter_futex_t;
-typedef struct { int nr; long ret; } tp_args_syscalls_sys_exit_futex_t;
-typedef struct { int nr; unsigned long op; unsigned long args[6]; } tp_args_syscalls_sys_enter_write_t;
-typedef struct { int nr; long ret; } tp_args_syscalls_sys_exit_write_t;
+typedef struct { union { int nr; long id; }; unsigned long op; unsigned long args[6]; } tp_args_syscalls_sys_enter_read_t;
+typedef struct { union { int nr; long id; }; unsigned long op; unsigned long args[6]; } tp_args_syscalls_sys_enter_futex_t;
+typedef struct { union { int nr; long id; }; long ret; } tp_args_syscalls_sys_exit_futex_t;
+typedef struct { union { int nr; long id; }; unsigned long op; unsigned long args[6]; } tp_args_syscalls_sys_enter_write_t;
+typedef struct { union { int nr; long id; }; long ret; } tp_args_syscalls_sys_exit_write_t;
+typedef struct { union { int nr; long id; }; unsigned long op; unsigned long args[6]; } tp_args_syscalls_sys_enter_epoll_pwait_t;
+typedef struct { union { int nr; long id; }; long ret; } tp_args_syscalls_sys_exit_epoll_pwait_t;
+typedef struct { union { int nr; long id; }; unsigned long op; unsigned long args[6]; } tp_args_syscalls_sys_enter_epoll_wait_t;
+typedef struct { union { int nr; long id; }; long ret; } tp_args_syscalls_sys_exit_epoll_wait_t;
 typedef struct { int parent_pid; int child_pid; } tp_args_sched_sched_process_fork_t;
 typedef struct { int pid; int prio; int target_cpu; } tp_args_sched_sched_waking_t;
 typedef struct { int pid; int prio; int target_cpu; } tp_args_sched_sched_wakeup_t;

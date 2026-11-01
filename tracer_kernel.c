@@ -185,6 +185,9 @@ struct tid_ctx_t {
     u64 acc_off_cpu_ns;     // Cumulative Off-CPU sleep/preemption/I/O wait ns for this thread
     u64 acc_block_io_ns;    // Cumulative Block I/O wait ns (block_rq_issue -> block_rq_complete)
     u64 copy_enter_ts;      // L5 MM/SKB: skb_copy_datagram_iter entry timestamp
+    u64 epoll_enter_ts;     // L5 Event Multiplexing: sys_enter_epoll_pwait entry timestamp
+    u64 epoll_wait_ns;      // L5 Event Multiplexing: duration spent inside epoll_pwait
+    u32 epoll_ready_rem;    // L5 Event Multiplexing: count of ready FDs returned by epoll_pwait
     u64 active_sk_ptr;      // L4.5 Socket: Stashed struct sock *sk across blocking sk_wait_data() -> kretprobe__tcp_recvmsg
     u64 active_msg_name;    // L4.5 UDP Socket: Stashed msg->msg_name across udp_recvmsg -> kretprobe__udp_recvmsg
     u32 pid;
@@ -437,7 +440,7 @@ int xdp_ingress_filter(struct xdp_md *ctx)
     void *nh_ptr = (void *)(eth + 1);
     #pragma unroll
     for (int i = 0; i < 2; i++) {
-        if (h_proto == 0x8100 || h_proto == 0x88A8) {
+        if (h_proto == 0x8100 || h_proto == 0x88A8 || h_proto == 0x9100) {
             if (nh_ptr + 4 > data_end)
                 return XDP_PASS;
             u16 *vlan_hdr = (u16 *)nh_ptr;
@@ -451,6 +454,9 @@ int xdp_ingress_filter(struct xdp_md *ctx)
 
     struct iphdr *iph = (struct iphdr *)nh_ptr;
     if ((void *)(iph + 1) > data_end)
+        return XDP_PASS;
+
+    if ((iph->version & 0x0f) != 4 || (bpf_ntohs(iph->frag_off) & 0x1FFF) != 0)
         return XDP_PASS;
 
     u32 ihl_len = (iph->ihl & 0x0f) * 4;
@@ -547,10 +553,15 @@ TRACEPOINT_PROBE(net, netif_receive_skb)
 
     u16 h_proto = bpf_ntohs(proto);
     u16 vlan_id = 0;
+    u16 vlan_tci = 0;
+    bpf_probe_read_kernel(&vlan_tci, sizeof(vlan_tci), &skb->vlan_tci);
+    if ((vlan_tci & 0x0FFF) != 0)
+        vlan_id = vlan_tci & 0x0FFF;
+
     unsigned char *nh_ptr = data;
     #pragma unroll
     for (int i = 0; i < 2; i++) {
-        if (h_proto == 0x8100 || h_proto == 0x88A8) {
+        if (h_proto == 0x8100 || h_proto == 0x88A8 || h_proto == 0x9100) {
             u16 vlan_hdr[2] = {};
             bpf_probe_read_kernel(vlan_hdr, sizeof(vlan_hdr), nh_ptr);
             vlan_id = bpf_ntohs(vlan_hdr[0]) & 0x0FFF;
@@ -558,10 +569,14 @@ TRACEPOINT_PROBE(net, netif_receive_skb)
             nh_ptr += 4;
         }
     }
+    if (h_proto != ETH_P_IP_HOST)
+        return 0;
 
     struct iphdr iph = {};
     bpf_probe_read_kernel(&iph, sizeof(iph), nh_ptr);
     if ((iph.version & 0x0f) != 4 || iph.protocol != IPPROTO_TCP)
+        return 0;
+    if ((bpf_ntohs(iph.frag_off) & 0x1FFF) != 0)
         return 0;
 
     u32 ihl_len = (iph.ihl & 0x0f) * 4;
@@ -569,6 +584,9 @@ TRACEPOINT_PROBE(net, netif_receive_skb)
         return 0;
     struct tcphdr tcph = {};
     bpf_probe_read_kernel(&tcph, sizeof(tcph), nh_ptr + ihl_len);
+    u16 doff_len = (tcph.doff & 0x0f) * 4;
+    if (doff_len < sizeof(struct tcphdr))
+        return 0;
 
     u16 sport = bpf_ntohs(tcph.source);
     u16 dport = bpf_ntohs(tcph.dest);
@@ -585,7 +603,6 @@ TRACEPOINT_PROBE(net, netif_receive_skb)
     key.family = AF_INET;
 
     u16 tot_len = bpf_ntohs(iph.tot_len);
-    u16 doff_len = (tcph.doff & 0x0f) * 4;
     u16 tcp_payload_len = (tot_len > (ihl_len + doff_len)) ? (tot_len - ihl_len - doff_len) : 0;
 
     struct flow_state_t *existing = ingress_flow_map.lookup(&key);
@@ -642,14 +659,22 @@ int kprobe__ip_rcv(struct pt_regs *ctx, struct sk_buff *skb)
 
     struct iphdr iph = {};
     bpf_probe_read_kernel(&iph, sizeof(iph), head + net_off);
-    if (iph.protocol != IPPROTO_TCP)
+    if ((iph.version & 0x0f) != 4 || iph.protocol != IPPROTO_TCP)
         return 0;
 
     /* At ip_rcv entry (ip_input.c:552), skb->transport_header is uninitialized! */
     u16 ihl_bytes = (iph.ihl & 0x0f) * 4;
+    if (ihl_bytes < sizeof(struct iphdr))
+        return 0;
+    if ((bpf_ntohs(iph.frag_off) & 0x1FFF) != 0)
+        return 0;
+
     u16 trans_off = net_off + ihl_bytes;
     struct tcphdr tcph = {};
     bpf_probe_read_kernel(&tcph, sizeof(tcph), head + trans_off);
+    u16 doff_len = (tcph.doff & 0x0f) * 4;
+    if (doff_len < sizeof(struct tcphdr))
+        return 0;
 
     u16 sport = bpf_ntohs(tcph.source);
     u16 dport = bpf_ntohs(tcph.dest);
@@ -775,9 +800,19 @@ TRACEPOINT_PROBE(tcp, tcp_retransmit_skb)
     key.proto  = IPPROTO_TCP;
     key.family = AF_INET;
 
-    struct flow_state_t *state = ingress_flow_map.lookup(&key);
+    struct flow_state_t *state = egress_flow_map.lookup(&key);
     if (!state)
-        state = egress_flow_map.lookup(&key);
+        state = ingress_flow_map.lookup(&key);
+    if (!state) {
+        struct flow_key_t rev_key = key;
+        rev_key.saddr = key.daddr;
+        rev_key.daddr = key.saddr;
+        rev_key.sport = key.dport;
+        rev_key.dport = key.sport;
+        state = ingress_flow_map.lookup(&rev_key);
+        if (!state)
+            state = egress_flow_map.lookup(&rev_key);
+    }
     if (!state)
         return 0;
 
@@ -844,24 +879,26 @@ TRACEPOINT_PROBE(skb, kfree_skb)
         if (head) {
             struct iphdr iph = {};
             bpf_probe_read_kernel(&iph, sizeof(iph), head + net_off);
-            if (iph.protocol == IPPROTO_TCP) {
+            if ((iph.version & 0x0f) == 4 && iph.protocol == IPPROTO_TCP) {
                 u16 ihl_bytes = (iph.ihl & 0x0f) * 4;
-                struct tcphdr tcph = {};
-                bpf_probe_read_kernel(&tcph, sizeof(tcph), head + net_off + ihl_bytes);
-                struct flow_key_t ikey = {};
-                ikey.saddr  = iph.saddr;
-                ikey.daddr  = iph.daddr;
-                ikey.sport  = bpf_ntohs(tcph.source);
-                ikey.dport  = bpf_ntohs(tcph.dest);
-                ikey.proto  = IPPROTO_TCP;
-                ikey.family = AF_INET;
-                struct flow_state_t *istate = ingress_flow_map.lookup(&ikey);
-                if (istate) {
-                    emit_kray_event(
-                        istate->req_id, (u64)args->reason, now, 0,
-                        istate->pid, istate->tid, 0,
-                        ikey.saddr, ikey.daddr, ikey.sport, ikey.dport,
-                        LAYER_KERNEL_NET, 0, OSI_L4_TCP, FLAG_SKB_DROP);
+                if (ihl_bytes >= sizeof(struct iphdr)) {
+                    struct tcphdr tcph = {};
+                    bpf_probe_read_kernel(&tcph, sizeof(tcph), head + net_off + ihl_bytes);
+                    struct flow_key_t ikey = {};
+                    ikey.saddr  = iph.saddr;
+                    ikey.daddr  = iph.daddr;
+                    ikey.sport  = bpf_ntohs(tcph.source);
+                    ikey.dport  = bpf_ntohs(tcph.dest);
+                    ikey.proto  = IPPROTO_TCP;
+                    ikey.family = AF_INET;
+                    struct flow_state_t *istate = ingress_flow_map.lookup(&ikey);
+                    if (istate) {
+                        emit_kray_event(
+                            istate->req_id, (u64)args->reason, now, 0,
+                            istate->pid, istate->tid, 0,
+                            ikey.saddr, ikey.daddr, ikey.sport, ikey.dport,
+                            LAYER_KERNEL_NET, 0, OSI_L4_TCP, FLAG_SKB_DROP);
+                    }
                 }
             }
         }
@@ -900,6 +937,10 @@ int kprobe__tcp_recvmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr *msg
     if (!zero_template)
         return 0;
 
+    struct tid_ctx_t *existing_ctx = active_ctx_map.lookup(&tid);
+    u64 saved_epoll_wait_ns = existing_ctx ? existing_ctx->epoll_wait_ns : 0;
+    u32 saved_epoll_ready_rem = existing_ctx ? existing_ctx->epoll_ready_rem : 0;
+
     /* Strictly read-only zero_ctx_map[0] template initialization */
     active_ctx_map.update(&tid, zero_template);
     struct tid_ctx_t *tctx = active_ctx_map.lookup(&tid);
@@ -909,6 +950,8 @@ int kprobe__tcp_recvmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr *msg
     tctx->pid = tgid;
     tctx->tid = tid;
     tctx->active_sk_ptr = (u64)sk;
+    tctx->epoll_wait_ns = saved_epoll_wait_ns;
+    tctx->epoll_ready_rem = saved_epoll_ready_rem;
 
     struct flow_key_t key = {};
     populate_sock_flow_key(sk, &key, IPPROTO_TCP, 0);
@@ -1106,8 +1149,8 @@ TRACEPOINT_PROBE(syscalls, sys_enter_futex)
     u32 cmd = raw_op & 0x7f;
 #endif
 
-    /* Wait operations: FUTEX_WAIT(0), FUTEX_WAIT_BITSET(9), FUTEX_LOCK_PI(6), FUTEX_WAIT_REQUEUE_PI(11) */
-    if (cmd == 0 || cmd == 9 || cmd == 6 || cmd == 11) {
+    /* Wait operations: FUTEX_WAIT(0), FUTEX_WAIT_BITSET(9), FUTEX_LOCK_PI(6), FUTEX_WAIT_REQUEUE_PI(11), FUTEX_LOCK_PI2(13) */
+    if (cmd == 0 || cmd == 9 || cmd == 6 || cmd == 11 || cmd == 13) {
         struct tid_ctx_t *tctx = active_ctx_map.lookup(&tid);
         if (!tctx) {
             u32 target_pid = get_target_pid();
@@ -1141,14 +1184,17 @@ TRACEPOINT_PROBE(syscalls, sys_enter_futex)
 
 TRACEPOINT_PROBE(syscalls, sys_exit_futex)
 {
-    if (args->ret < 0)
-        return 0;
-
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 tgid = (u32)(pid_tgid >> 32);
     u32 tid  = (u32)pid_tgid;
 
     struct tid_ctx_t *tctx = active_ctx_map.lookup(&tid);
+    if (args->ret < 0 && args->ret != -11) {
+        if (tctx)
+            tctx->futex_enter_ts = 0;
+        return 0;
+    }
+
     if (tctx && tctx->req_id != 0)
         return 0;
 
@@ -1185,6 +1231,66 @@ TRACEPOINT_PROBE(syscalls, sys_exit_futex)
         }
     }
     return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_enter_epoll_pwait)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 tgid = (u32)(pid_tgid >> 32);
+    u32 tid  = (u32)pid_tgid;
+    u64 now  = bpf_ktime_get_ns();
+
+    struct tid_ctx_t *tctx = active_ctx_map.lookup(&tid);
+    if (!tctx) {
+        u32 target_pid = get_target_pid();
+        if (target_pid != 0 && tgid != target_pid)
+            return 0;
+        u32 zero_idx = 0;
+        struct tid_ctx_t *zero_template = zero_ctx_map.lookup(&zero_idx);
+        if (!zero_template)
+            return 0;
+        active_ctx_map.update(&tid, zero_template);
+        tctx = active_ctx_map.lookup(&tid);
+        if (tctx) {
+            tctx->pid = tgid;
+            tctx->tid = tid;
+        }
+    }
+    if (tctx) {
+        tctx->epoll_enter_ts = now;
+    }
+    return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_epoll_pwait)
+{
+    u32 tid = (u32)bpf_get_current_pid_tgid();
+    struct tid_ctx_t *tctx = active_ctx_map.lookup(&tid);
+    if (!tctx || tctx->epoll_enter_ts == 0)
+        return 0;
+
+    if (args->ret <= 0) {
+        tctx->epoll_enter_ts  = 0;
+        tctx->epoll_wait_ns   = 0;
+        tctx->epoll_ready_rem = 0;
+        return 0;
+    }
+
+    u64 now = bpf_ktime_get_ns();
+    tctx->epoll_wait_ns   = (now > tctx->epoll_enter_ts) ? (now - tctx->epoll_enter_ts) : 0;
+    tctx->epoll_ready_rem = (u32)args->ret;
+    tctx->epoll_enter_ts  = 0;
+    return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_enter_epoll_wait)
+{
+    return tracepoint__syscalls__sys_enter_epoll_pwait((tp_args_syscalls_sys_enter_epoll_pwait_t *)args);
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_epoll_wait)
+{
+    return tracepoint__syscalls__sys_exit_epoll_pwait((tp_args_syscalls_sys_exit_epoll_pwait_t *)args);
 }
 
 TRACEPOINT_PROBE(sched, sched_process_fork)
@@ -1454,9 +1560,13 @@ int trace_uprobe_entry(struct pt_regs *ctx)
     /*
      * Protect fn_entry_ip[0..15] and fn_entry_ts[0..15] from wrap-around overwrite
      * when recursion / call depth exceeds MAX_CALL_DEPTH (16)!
+     * Note: asm volatile barrier prevents Clang from optimizing away &= 15 inside
+     * the (raw_depth < 16) branch, keeping the Linux 5.14 BPF Verifier range tracker happy.
      */
     if (raw_depth < MAX_CALL_DEPTH) {
-        u32 slot = raw_depth & (MAX_CALL_DEPTH - 1);
+        u32 slot = raw_depth;
+        asm volatile("" : "+r"(slot));
+        slot &= (MAX_CALL_DEPTH - 1);
         tctx->fn_entry_ip[slot]     = entry_ip;
         tctx->fn_entry_ts[slot]     = now;
         tctx->fn_off_cpu_snap[slot] = off_cpu_snap;
@@ -1489,16 +1599,12 @@ int trace_uprobe_return(struct pt_regs *ctx)
 
     tctx->call_depth--;
     u8 raw_depth = tctx->call_depth;
+    u32 slot = raw_depth & (MAX_CALL_DEPTH - 1);
     u64 now = bpf_ktime_get_ns();
-    u64 fn_dur = 0;
-    u64 orig_ip = PT_REGS_IP(ctx);
-
-    if (raw_depth < MAX_CALL_DEPTH) {
-        u32 slot = raw_depth & (MAX_CALL_DEPTH - 1);
-        fn_dur  = now - tctx->fn_entry_ts[slot];
-        /* Restore saved fn_entry_ip[slot] instead of [uprobes] trampoline PT_REGS_IP(ctx)! */
-        orig_ip = tctx->fn_entry_ip[slot];
-    }
+    u64 saved_ts = tctx->fn_entry_ts[slot];
+    /* Restore saved fn_entry_ip[slot] instead of [uprobes] trampoline PT_REGS_IP(ctx)! Guard against recursion depth >= 16 */
+    u64 orig_ip = (raw_depth < MAX_CALL_DEPTH) ? tctx->fn_entry_ip[slot] : 0;
+    u64 fn_dur  = (raw_depth < MAX_CALL_DEPTH) ? (now - saved_ts) : 0;
 
     u8 report_depth = (raw_depth < MAX_CALL_DEPTH) ? raw_depth : (MAX_CALL_DEPTH - 1);
     emit_kray_event(
@@ -1736,21 +1842,29 @@ int kprobe__ipv6_rcv(struct pt_regs *ctx, struct sk_buff *skb)
     struct ipv6hdr ip6h = {};
     bpf_probe_read_kernel(&ip6h, sizeof(ip6h), head + net_off);
 
-    /* At ipv6_rcv entry (ip6_input.c:302), unroll up to 2 IPv6 extension headers (0, 43, 44, 60) */
+    /* At ipv6_rcv entry (ip6_input.c:302), unroll up to 4 IPv6 extension headers (0, 43, 44, 51, 60) */
     u8 nexthdr = ip6h.nexthdr;
     u16 trans_off = net_off + sizeof(struct ipv6hdr);
     #pragma unroll
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 4; i++) {
         if (nexthdr == 0 || nexthdr == 43 || nexthdr == 60) {
             u8 ext_hdr[2] = {};
             bpf_probe_read_kernel(ext_hdr, sizeof(ext_hdr), head + trans_off);
             nexthdr = ext_hdr[0];
             trans_off += (u16)(ext_hdr[1] + 1) * 8;
         } else if (nexthdr == 44) {
-            u8 frag_hdr[2] = {};
+            u8 frag_hdr[4] = {};
             bpf_probe_read_kernel(frag_hdr, sizeof(frag_hdr), head + trans_off);
             nexthdr = frag_hdr[0];
+            u16 frag_off = ((u16)frag_hdr[2] << 8) | frag_hdr[3];
+            if ((frag_off & 0xFFF8) != 0)
+                return 0; /* Non-first IPv6 fragment lacks L4 header */
             trans_off += 8;
+        } else if (nexthdr == 51) {
+            u8 ah_hdr[2] = {};
+            bpf_probe_read_kernel(ah_hdr, sizeof(ah_hdr), head + trans_off);
+            nexthdr = ah_hdr[0];
+            trans_off += (u16)(ah_hdr[1] + 2) * 4;
         }
     }
     if (nexthdr != IPPROTO_TCP && nexthdr != IPPROTO_UDP)

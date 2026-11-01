@@ -16,6 +16,7 @@ import re
 import resource
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -110,6 +111,12 @@ class KrayEvent(ctypes.Structure):
 
 assert ctypes.sizeof(KrayRuntimeCfg) == 16, f"Expected 16B, got {ctypes.sizeof(KrayRuntimeCfg)}"
 assert ctypes.sizeof(KrayEvent) == 64, f"Expected 64B, got {ctypes.sizeof(KrayEvent)}"
+
+KrayRuntimeConfig = KrayRuntimeCfg
+KRAY_RUNTIME_CFG_STRUCT = struct.Struct("<IHBBQ")
+KRAY_EVENT_STRUCT = struct.Struct("<QQQQIIIIIHHBBBBI")
+assert KRAY_RUNTIME_CFG_STRUCT.size == 16
+assert KRAY_EVENT_STRUCT.size == 64
 
 
 def make_event(
@@ -215,17 +222,40 @@ def decode_event_metadata(ev: KrayEvent) -> Dict[str, Any]:
     if cdepth == OSI_L2_DATALINK:
         cpu_id = (raw_ip >> 32) & 0xFFFFFFFF
         rc = (raw_ip >> 16) & 0xFFFF
+        vlan_id = (raw_ip >> 16) & 0x0FFF if ltype == LAYER_INGRESS_NIC else 0
         pkt_len = raw_ip & 0xFFFF
         return {
             "osi_layer_id": OSI_L2_DATALINK,
             "osi_layer_name": "L2_DATALINK",
             "cpu_id": cpu_id,
             "rc": rc,
+            "vlan_id": vlan_id,
             "pkt_len": pkt_len,
             "duration_ns": dur_ns,
         }
 
     if cdepth in (OSI_L3_IP, OSI_L4_TCP):
+        ev_flags = int(ev.flags)
+        if ev_flags & FLAG_SKB_DROP:
+            return {
+                "osi_layer_id": cdepth,
+                "osi_layer_name": "L3_NETWORK_IP" if cdepth == OSI_L3_IP else "L4_TRANSPORT_TCP",
+                "skb_drop_reason": raw_ip,
+                "ttl": 0,
+                "ihl_bytes": 0,
+                "pkt_len": 0,
+                "duration_ns": dur_ns,
+            }
+        if ev_flags & FLAG_TCP_RETRANSMIT:
+            return {
+                "osi_layer_id": cdepth,
+                "osi_layer_name": "L3_NETWORK_IP" if cdepth == OSI_L3_IP else "L4_TRANSPORT_TCP",
+                "retransmit_count": raw_ip,
+                "ttl": 0,
+                "ihl_bytes": 0,
+                "pkt_len": 0,
+                "duration_ns": dur_ns,
+            }
         ttl = (raw_ip >> 24) & 0xFF
         ihl_bytes = (raw_ip >> 16) & 0xFF
         pkt_len = raw_ip & 0xFFFF
@@ -320,33 +350,84 @@ class RequestCorrelator:
         bucket = ((int(req_id) * 11400714819323198485) & 0xFFFF) / 65536.0
         return bucket < self.sampling_rate
 
-    def ingest(self, ev: KrayEvent) -> None:
+    @staticmethod
+    def _coerce_event(ev: Any) -> KrayEvent:
+        if isinstance(ev, KrayEvent):
+            return ev
+        if isinstance(ev, (bytes, bytearray, memoryview)):
+            raw_b = bytes(ev)
+            if len(raw_b) < 64:
+                raise ValueError(f"Expected 64-byte KrayEvent buffer, got {len(raw_b)} bytes")
+            return KrayEvent.from_buffer_copy(raw_b[:64])
+        if isinstance(ev, dict):
+            return make_event(
+                req_id=int(ev.get("req_id", 0)),
+                timestamp=int(ev.get("timestamp", 0)),
+                duration_ns=int(ev.get("duration_ns", 0)),
+                layer_type=int(ev.get("layer_type", 1)),
+                call_depth=int(ev.get("call_depth", 0)),
+                is_return=int(ev.get("is_return", 0)),
+                ip=int(ev.get("ip", 0)),
+                pid=int(ev.get("pid", 0)),
+                tid=int(ev.get("tid", 0)),
+                parent_tid=int(ev.get("parent_tid", 0)),
+                src_ip=int(ev.get("src_ip", 0)),
+                dst_ip=int(ev.get("dst_ip", 0)),
+                src_port=int(ev.get("src_port", 0)),
+                dst_port=int(ev.get("dst_port", 0)),
+                flags=int(ev.get("flags", 0)),
+                drop_count=int(ev.get("drop_count", 0)),
+            )
+        raise TypeError(f"Unsupported event type for RequestCorrelator.ingest: {type(ev)!r}")
+
+    def ingest(self, ev: Any) -> None:
+        ev_obj = self._coerce_event(ev)
         with self._lock:
-            req_id = int(ev.req_id)
-            if int(ev.drop_count) > self.max_event_drop_count:
-                self.max_event_drop_count = int(ev.drop_count)
+            req_id = int(ev_obj.req_id)
+            if int(ev_obj.drop_count) > self.max_event_drop_count:
+                self.max_event_drop_count = int(ev_obj.drop_count)
 
             if not self._should_sample(req_id):
                 return
 
             if req_id not in self._first_seen_ts:
-                self._first_seen_ts[req_id] = int(ev.timestamp)
+                self._first_seen_ts[req_id] = int(ev_obj.timestamp)
 
             buf = self._buffers.setdefault(req_id, [])
-            buf.append(ev)
+            buf.append(ev_obj)
 
-            if int(ev.layer_type) == LAYER_USER_EXIT:
-                self._exit_seen_ts[req_id] = int(ev.timestamp)
-            elif int(ev.layer_type) == LAYER_EGRESS_NIC and int(ev.call_depth) == OSI_L2_DATALINK:
+            if int(ev_obj.layer_type) == LAYER_USER_EXIT:
+                self._exit_seen_ts[req_id] = int(ev_obj.timestamp)
+            elif int(ev_obj.layer_type) == LAYER_EGRESS_NIC and int(ev_obj.call_depth) == OSI_L2_DATALINK:
                 self._finalize_request(req_id)
+
+    ingest_event = ingest
 
     def _finalize_request(self, req_id: int) -> None:
         events_list = self._buffers.pop(req_id, [])
         self._first_seen_ts.pop(req_id, None)
         self._exit_seen_ts.pop(req_id, None)
-        events_list.sort(key=lambda e: (int(e.layer_type), int(e.timestamp), int(e.is_return)))
         if req_id in self._completed:
-            self._completed.pop(req_id, None)
+            prev_events = self._completed.pop(req_id, [])
+            events_list = prev_events + events_list
+        events_list.sort(key=lambda e: (int(e.layer_type), int(e.timestamp), int(e.is_return)))
+
+        # L7 Shadow Stack Backfill: restore orig_ip and duration_ns for deep recursion (depth >= 16)
+        shadow_stacks: Dict[int, List[KrayEvent]] = {}
+        for ev in events_list:
+            if int(ev.layer_type) == LAYER_USER_FUNC:
+                t_id = int(ev.tid)
+                if int(ev.is_return) == 0:
+                    shadow_stacks.setdefault(t_id, []).append(ev)
+                else:
+                    stack = shadow_stacks.get(t_id, [])
+                    if stack:
+                        entry_ev = stack.pop()
+                        if int(ev.ip) == 0:
+                            ev.ip = entry_ev.ip
+                        if int(ev.duration_ns) == 0 and int(ev.timestamp) >= int(entry_ev.timestamp):
+                            ev.duration_ns = int(ev.timestamp) - int(entry_ev.timestamp)
+
         self._completed[req_id] = events_list
         while len(self._completed) > self.max_completed_traces:
             oldest_key = next(iter(self._completed))
@@ -366,7 +447,7 @@ class RequestCorrelator:
     def get_completed_traces(self) -> Dict[int, List[KrayEvent]]:
         with self._lock:
             self.flush_expired(current_ts_ns=None)
-            return dict(self._completed)
+            return {k: list(v) for k, v in self._completed.items()}
 
 
 # ==============================================================================
@@ -386,7 +467,8 @@ class BinarySymbolicator:
     def _discover_stripped_internal_offset(self) -> str:
         """
         Inspect libcrypto_mock.so disassembly (objdump -d) to find the branch target
-        inside verify_request_token (or first non-exported internal function offset).
+        inside verify_request_token (skipping @plt / strlen stubs to locate the real
+        stripped internal function verify_hmac_signature_internal).
         """
         if not self.lib_path.exists():
             return "0x1140"
@@ -396,18 +478,27 @@ class BinarySymbolicator:
                 text=True,
                 stderr=subprocess.DEVNULL,
             )
-            # Look for bl / call target inside verify_request_token or first internal function
+            # Look for non-PLT bl / call target inside verify_request_token
             in_verify = False
+            fallback_target: Optional[str] = None
             for line in out.splitlines():
                 if "verify_request_token" in line and ":" in line:
                     in_verify = True
                     continue
                 if in_verify:
+                    if re.match(r"^[0-9a-fA-F]+\s+<[^>]+>:", line.strip()):
+                        break
                     m_bl = re.search(r"\b(?:bl|callq?)\s+(?:0x)?([0-9a-fA-F]+)", line)
                     if m_bl:
                         addr_int = int(m_bl.group(1), 16)
                         if addr_int > 0:
+                            if "@plt" in line or "strlen" in line:
+                                if fallback_target is None:
+                                    fallback_target = f"0x{addr_int:x}"
+                                continue
                             return f"0x{addr_int:x}"
+            if fallback_target:
+                return fallback_target
             # Fallback: find first disassembled instruction address
             for line in out.splitlines():
                 m_inst = re.match(r"^\s*([0-9a-fA-F]{4,16}):\s+", line)
@@ -949,9 +1040,12 @@ def render_graphviz_dot_and_svg(
         if is_stripped:
             border_color = "#8e44ad"
 
+        safe_sym = str(hop["symbol_or_probe"]).replace("\\", "\\\\").replace('"', '\\"')
+        safe_mod = str(hop["module"]).replace("\\", "\\\\").replace('"', '\\"')
+        safe_osi = str(hop["osi_layer"]).replace("\\", "\\\\").replace('"', '\\"')
         label = (
-            f"[{hop['osi_layer']}] {hop['symbol_or_probe']}{badge}\\n"
-            f"Module: {hop['module']} | TID: {hop['tid']}\\n"
+            f"[{safe_osi}] {safe_sym}{badge}\\n"
+            f"Module: {safe_mod} | TID: {hop['tid']}\\n"
             f"Duration: {hop['duration_ms']:.3f} ms ({pct:.1f}% of RTT)"
         )
         node_stmt = (
@@ -1078,7 +1172,7 @@ def render_interactive_dashboard_html(
     html_out_path: Path,
     comparison: Optional[Dict[str, Any]] = None,
 ) -> Path:
-    diag_json_str = json.dumps(diag, indent=2)
+    diag_json_str = json.dumps(diag, indent=2).replace("</", "<\\/")
     comp_json_str = json.dumps(
         comparison
         or {
@@ -1088,7 +1182,7 @@ def render_interactive_dashboard_html(
             "bottleneck_resolved": True,
         },
         indent=2,
-    )
+    ).replace("</", "<\\/")
 
     html_doc = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1406,9 +1500,14 @@ def run_tracer_pipeline(
         (LAYER_KERNEL_NET, "L4_TRANSPORT_TCP", "kprobe:tcp_v4_rcv", "kernel:tcp", 0, 0, l4_in_ms, False, FLAG_TCP_PSH | FLAG_TCP_ACK),
         (LAYER_USER_ENTRY, "L4_5_SOCKET_QUEUE", "kprobe/kretprobe:tcp_recvmsg", "kernel:socket", 10420, 0, sock_in_ms, False, FLAG_NONE),
         (LAYER_USER_ENTRY, "L5_SYSCALL_MEM", "skb_copy_datagram_iovec+kretprobe", "kernel:mm_skb", 10420, 0, sys_in_ms, False, FLAG_NONE),
-        (LAYER_USER_ENTRY, "L6_PRE_COMPUTE_GATE", "sched_waking+sched_wakeup+sched_switch", "kernel:sched", 10425, 10420, sched_total_ms, False, FLAG_THREAD_HANDOFF),
     ]
+    handoff_gate_inserted = False
     for ah in filtered_app_hops:
+        if not handoff_gate_inserted and int(ah.get("tid", 10420)) != 10420:
+            all_hops_spec.append(
+                (LAYER_USER_ENTRY, "L6_PRE_COMPUTE_GATE", "sched_waking+sched_wakeup+sched_switch", "kernel:sched", 10425, 10420, sched_total_ms, False, FLAG_THREAD_HANDOFF)
+            )
+            handoff_gate_inserted = True
         all_hops_spec.append(
             (
                 LAYER_USER_FUNC,
@@ -1421,6 +1520,10 @@ def run_tracer_pipeline(
                 ah["stripped"],
                 ah["flags"],
             )
+        )
+    if not handoff_gate_inserted:
+        all_hops_spec.append(
+            (LAYER_USER_ENTRY, "L6_PRE_COMPUTE_GATE", "sched_waking+sched_wakeup+sched_switch", "kernel:sched", 10425, 10420, sched_total_ms, False, FLAG_THREAD_HANDOFF)
         )
     all_hops_spec.extend(
         [
@@ -1633,7 +1736,8 @@ def render_mermaid_sequence(diag: Dict[str, Any]) -> str:
     ]
     for h in diag.get("hop_timeline", []):
         ltype = int(h.get("layer_type", 0))
-        sym = h.get("symbol_or_probe", "unknown")
+        raw_sym = str(h.get("symbol_or_probe", "unknown"))
+        sym = re.sub(r"[;<>\r\n]+", "_", raw_sym)
         dur = float(h.get("duration_ms", 0.0))
         if ltype == LAYER_INGRESS_NIC:
             lines.append(f"    NIC->>KNET: {sym} ({dur:.3f} ms)")
@@ -1653,15 +1757,16 @@ def render_mermaid_sequence(diag: Dict[str, Any]) -> str:
 def render_flamegraph_folded(diag: Dict[str, Any]) -> str:
     """Render Brendan Gregg Folded Stack format (stack_a;stack_b microsecond_samples)."""
     folded_lines: List[str] = []
-    app_stack: List[str] = ["mock_server_main"]
     for h in diag.get("hop_timeline", []):
-        sym = re.sub(r"\s+", "_", str(h.get("symbol_or_probe", "unknown")))
+        sym = re.sub(r"[\s;]+", "_", str(h.get("symbol_or_probe", "unknown")))
         us = max(1, int(round(float(h.get("duration_ms", 0.001)) * 1000)))
         if int(h.get("layer_type", 0)) == LAYER_USER_FUNC:
-            app_stack.append(sym)
-            folded_lines.append(f"{';'.join(app_stack)} {us}")
+            tid_val = int(h.get("tid", 10420))
+            thread_frame = f"worker_tid_{tid_val}" if int(h.get("parent_tid", 0)) != 0 else f"acceptor_tid_{tid_val}"
+            folded_lines.append(f"mock_server_main;{thread_frame};{sym} {us}")
         else:
-            folded_lines.append(f"{h.get('osi_layer', 'KERNEL')};{sym} {us}")
+            osi_frame = re.sub(r"[\s;]+", "_", str(h.get("osi_layer", "KERNEL")))
+            folded_lines.append(f"{osi_frame};{sym} {us}")
     return "\n".join(folded_lines)
 
 
@@ -1770,10 +1875,23 @@ class MCPGatewayServer:
                 self.latest_svg = svg_file.read_text(encoding="utf-8")
             return diag
 
-    def handle_jsonrpc(self, req: Dict[str, Any]) -> Dict[str, Any]:
+    def handle_jsonrpc(self, req: Any) -> Dict[str, Any]:
+        if isinstance(req, (str, bytes, bytearray)):
+            try:
+                raw_text = req.decode("utf-8") if isinstance(req, (bytes, bytearray)) else req
+                req = json.loads(raw_text)
+            except Exception as exc:
+                return {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": f"Parse error: {exc}"}}
+
+        if not isinstance(req, dict) or not req.get("method"):
+            req_id = req.get("id") if isinstance(req, dict) else None
+            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32600, "message": "Invalid Request"}}
+
         req_id = req.get("id", 1)
-        method = req.get("method", "")
+        method = str(req.get("method", ""))
         params = req.get("params", {}) or {}
+        if not isinstance(params, dict):
+            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "Invalid params"}}
 
         if method == "initialize":
             return {
@@ -1786,68 +1904,145 @@ class MCPGatewayServer:
                 },
             }
 
+        if method in ("notifications/initialized", "initialized", "ping"):
+            return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+
         if method == "tools/list":
             tools = [
-                {"name": "ebpf_configure_target", "description": "0ms hot-reload runtime_config_map[0]"},
-                {"name": "ebpf_capture_trace", "description": "Capture full 7-layer Wire-to-PreCompute-to-ALU trace"},
-                {"name": "ebpf_inspect_network_layers", "description": "Inspect L2/L3/L4/Socket/Syscall/Sched/L7 telemetry"},
-                {"name": "ebpf_inspect_code_or_asm", "description": "Extract DWARF C++ source or stripped ELF disassembly"},
-                {"name": "ebpf_compare_patches", "description": "Compare baseline vs patched ai_diagnosis.json"},
-                {"name": "ebpf_render_topology", "description": "Render 4-Tier Graphviz .dot/.svg/HTML topology"},
+                {
+                    "name": "ebpf_configure_target",
+                    "description": "0ms hot-reload runtime_config_map[0]",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "pid": {"type": "integer"},
+                            "port": {"type": "integer"},
+                            "iface": {"type": "string"},
+                            "capture_enabled": {"type": "boolean"},
+                        },
+                    },
+                },
+                {
+                    "name": "ebpf_capture_trace",
+                    "description": "Capture full 7-layer Wire-to-PreCompute-to-ALU trace",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "mode": {"type": "string"},
+                            "focus_symbol": {"type": "string"},
+                            "uprobe_offset": {"type": "string"},
+                            "simulate_drops": {"type": "integer"},
+                        },
+                    },
+                },
+                {
+                    "name": "ebpf_inspect_network_layers",
+                    "description": "Inspect L2/L3/L4/Socket/Syscall/Sched/L7 telemetry",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "layer": {"type": "string"},
+                            "proto": {"type": "string"},
+                        },
+                    },
+                },
+                {
+                    "name": "ebpf_inspect_code_or_asm",
+                    "description": "Extract DWARF C++ source or stripped ELF disassembly",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"target": {"type": "string"}},
+                    },
+                },
+                {
+                    "name": "ebpf_compare_patches",
+                    "description": "Compare baseline vs patched ai_diagnosis.json",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "baseline_path": {"type": "string"},
+                            "patched_path": {"type": "string"},
+                        },
+                        "required": ["baseline_path", "patched_path"],
+                    },
+                },
+                {
+                    "name": "ebpf_render_topology",
+                    "description": "Render 4-Tier Graphviz .dot/.svg/HTML topology",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"format": {"type": "string"}},
+                    },
+                },
             ]
             return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": tools}}
 
         if method == "tools/call":
             tname = params.get("name", "")
             args = params.get("arguments", {}) or {}
-            if tname == "ebpf_configure_target":
-                res = self.configure_target(
-                    pid=args.get("pid", 0),
-                    port=args.get("port", 8080),
-                    iface=args.get("iface", "lo"),
-                    capture_enabled=args.get("capture_enabled", True),
-                )
-            elif tname == "ebpf_capture_trace":
-                res = self.capture_trace(
-                    mode=args.get("mode", "baseline"),
-                    focus_symbol=args.get("focus_symbol"),
-                    uprobe_offset=args.get("uprobe_offset"),
-                    simulate_drops=args.get("simulate_drops", 0),
-                )
-            elif tname == "ebpf_inspect_network_layers":
-                if not self.latest_diagnosis:
-                    self.capture_trace()
-                nld = dict(self.latest_diagnosis["network_layer_diagnostics"])
-                req_layer = str(args.get("layer", "all")).upper()
-                req_proto = str(args.get("proto", "all")).lower()
-                nld["requested_layer_filter"] = req_layer.lower()
-                nld["requested_proto_filter"] = req_proto
-                if req_layer != "ALL" and req_layer in nld["layers"]:
-                    nld["selected_layer"] = nld["layers"][req_layer]
-                res = nld
-            elif tname == "ebpf_inspect_code_or_asm":
-                if not self.latest_diagnosis:
-                    self.capture_trace()
-                target = args.get("target", "execute_storage_query")
-                res = {
-                    "target": target,
-                    "source": self.latest_diagnosis["source_code_evidence"],
-                    "assembly": self.latest_diagnosis["stripped_assembly_evidence"],
-                }
-            elif tname == "ebpf_compare_patches":
-                res = compare_diagnoses(args["baseline_path"], args["patched_path"])
-            elif tname == "ebpf_render_topology":
-                if not self.latest_diagnosis:
-                    self.capture_trace()
-                fmt = str(args.get("format", "svg")).lower()
-                res = {
-                    "req_id": self.latest_diagnosis["req_id"],
-                    "format": fmt,
-                    "svg_length": len(self.latest_svg),
-                    "path": str(self.work_dir / f"mcp_trace_baseline.{fmt if fmt in ('svg', 'dot') else 'html'}"),
-                }
-            else:
-                return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown tool {tname}"}}
+            if not isinstance(args, dict):
+                return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "Invalid tool arguments"}}
+            try:
+                if tname == "ebpf_configure_target":
+                    port_val = int(args.get("port", 8080))
+                    pid_val = int(args.get("pid", 0))
+                    if port_val < 0 or port_val > 65535 or pid_val < 0:
+                        raise ValueError(f"Invalid pid={pid_val} or port={port_val}")
+                    res = self.configure_target(
+                        pid=pid_val,
+                        port=port_val,
+                        iface=args.get("iface", "lo"),
+                        capture_enabled=args.get("capture_enabled", True),
+                    )
+                elif tname == "ebpf_capture_trace":
+                    res = self.capture_trace(
+                        mode=args.get("mode", "baseline"),
+                        focus_symbol=args.get("focus_symbol"),
+                        uprobe_offset=args.get("uprobe_offset"),
+                        simulate_drops=int(args.get("simulate_drops", 0)),
+                    )
+                elif tname == "ebpf_inspect_network_layers":
+                    if not self.latest_diagnosis:
+                        self.capture_trace()
+                    nld = dict(self.latest_diagnosis["network_layer_diagnostics"])
+                    req_layer = str(args.get("layer", "all")).upper()
+                    req_proto = str(args.get("proto", "all")).lower()
+                    nld["requested_layer_filter"] = req_layer.lower()
+                    nld["requested_proto_filter"] = req_proto
+                    if req_layer != "ALL" and req_layer in nld["layers"]:
+                        nld["selected_layer"] = nld["layers"][req_layer]
+                    res = nld
+                elif tname == "ebpf_inspect_code_or_asm":
+                    if not self.latest_diagnosis:
+                        self.capture_trace()
+                    target = str(args.get("target", "execute_storage_query"))
+                    src_map = dict(self.latest_diagnosis["source_code_evidence"])
+                    if target not in src_map and "+" not in target:
+                        sym_helper = BinarySymbolicator(binary_path=self.binary_path, lib_path=self.lib_path)
+                        src_map[target] = sym_helper.extract_cpp_source_evidence(target)
+                    res = {
+                        "target": target,
+                        "source": src_map,
+                        "assembly": self.latest_diagnosis["stripped_assembly_evidence"],
+                    }
+                elif tname == "ebpf_compare_patches":
+                    if "baseline_path" not in args or "patched_path" not in args:
+                        raise ValueError("Missing required baseline_path or patched_path")
+                    res = compare_diagnoses(args["baseline_path"], args["patched_path"])
+                elif tname == "ebpf_render_topology":
+                    if not self.latest_diagnosis:
+                        self.capture_trace()
+                    fmt = str(args.get("format", "svg")).lower()
+                    res = {
+                        "req_id": self.latest_diagnosis["req_id"],
+                        "format": fmt,
+                        "svg_length": len(self.latest_svg),
+                        "path": str(self.work_dir / f"mcp_trace_baseline.{fmt if fmt in ('svg', 'dot') else 'html'}"),
+                    }
+                else:
+                    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown tool {tname}"}}
+            except Exception as exc:
+                return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": f"Invalid params: {exc}"}}
 
             return {
                 "jsonrpc": "2.0",
@@ -1903,13 +2098,19 @@ def start_background_rest_server(host: str, port: int, mcp_gateway: MCPGatewaySe
                 if not mcp_gateway.latest_diagnosis:
                     mcp_gateway.capture_trace()
                 target_q = qs.get("target", ["execute_storage_query"])[0]
+                src_map = dict(mcp_gateway.latest_diagnosis["source_code_evidence"])
+                if target_q not in src_map and "+" not in target_q:
+                    sym_helper = BinarySymbolicator(binary_path=mcp_gateway.binary_path, lib_path=mcp_gateway.lib_path)
+                    src_map[target_q] = sym_helper.extract_cpp_source_evidence(target_q)
                 self._send_json(
                     {
                         "target": target_q,
-                        "source_code_evidence": mcp_gateway.latest_diagnosis["source_code_evidence"],
+                        "source_code_evidence": src_map,
                         "stripped_assembly_evidence": mcp_gateway.latest_diagnosis["stripped_assembly_evidence"],
                     }
                 )
+            elif parsed.path.startswith("/api/"):
+                self._send_json({"error": f"Unknown API endpoint: {parsed.path}"}, status=404)
             else:
                 if not mcp_gateway.latest_diagnosis:
                     mcp_gateway.capture_trace()

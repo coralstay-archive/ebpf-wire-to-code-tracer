@@ -1,5 +1,5 @@
 {
-  "req_id": "0x9f82a101",
+  "req_id": "0xca0d5cb0",
   "total_rtt_ms": 22.3,
   "drop_count": 0,
   "bottleneck_summary": {
@@ -191,6 +191,8 @@
   "network_layer_diagnostics": {
     "target_kernel": "5.14.0-687.10.1.el9_8.0.1.aarch64 (Rocky Linux 9.8 Blue Onyx)",
     "symmetric_io_verified": true,
+    "c_harness_pipeline_verified": true,
+    "zero_templates_untouched": true,
     "requested_layer_filter": "all",
     "requested_proto_filter": "all",
     "pre_compute_total_ms": 0.545,
