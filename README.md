@@ -286,7 +286,54 @@ ssh ebpf-vm "sudo cat /sys/kernel/debug/tracing/trace_pipe"
 
 ---
 
-## 7. 라이선스
+## 7. 글로벌 산업계 eBPF 사례 및 본 프로젝트의 11대 실전 활용 방안 (Industry Use Cases & 11 Real-World Applications)
+
+### 1) 글로벌 빅테크 및 산업계 eBPF 프로덕션 활용 사례 vs 상용 도구 비교
+
+| 기업 / 분류 | 대표 사례 및 도구 | 핵심 기술 및 주력 영역 | 기존 도구의 한계와 본 프로젝트(`kray`)의 차별점 |
+| :--- | :--- | :--- | :--- |
+| **Meta / Cloudflare** | **Katran**, **Strobelight**, **XDP DDoS 방어** | NIC 드라이버 직후(`XDP`) 초고속 패킷 처리 및 `sched_switch` 기반 전사 CPU 스케줄링 분석 | 네트워크 계층(XDP)과 프로세스 프로파일러가 별도 시스템으로 분리되어 있음 → **`kray`는 L2 XDP에서 채번한 단일 `req_id`를 L7 유저 함수까지 끝까지 관통** |
+| **Netflix / MSA** | 스트리밍 게이트웨이 테일 레이턴시 분리 | 무중단 eBPF 부착으로 소켓 버퍼(`sk_rcvbuf`), 블록 I/O, 페이지 폴트 원인 실시간 분리 | 일회성 `bcc`/`bpftrace` 스크립트를 수동 조합해야 함 → **`kray`는 7계층 상관분석과 `[VERDICT]` 병목 자동 판정을 단일 C 데몬([`tracer_daemon.c`](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/tracer_daemon.c))으로 통합** |
+| **제로코드 eBPF APM** | **Grafana Beyla**, **Datadog USM**, **New Relic Pixie**, **Coroot** | 코드 수정 없이 HTTP/gRPC/DB 요청의 전체 응답 시간(RED 메트릭) 및 서비스 맵 시각화 | `read()`~`write()` 총 시간만 보여주며, **패킷 도착 후 `read()` 전까지 `sk_rcvbuf`에서 대기한 시간이나 스레드 풀 핸드오프(`futex`+`runqlat`) 지연을 쪼개지 못함** |
+| **클라우드 네트워크 / 프로파일러** | **Cilium Hubble**, **DeepFlow**, **Parca**, **Pyroscope** | L3/L4 파드 간 통신 흐름 관측 또는 `99Hz`(`10ms` 주기) CPU 샘플링 FlameGraph 생성 | 통계적 샘플링(`10ms`)이라 **마이크로초(`µs`) 단위의 단발성 스파이크 패킷과 특정 스레드의 C++/Rust 함수 실행을 1:1로 매칭하지 못함** |
+
+---
+
+### 2) 본 프로젝트(`eBPF-WireToCode-Tracer`)의 11대 실전 활용 시나리오
+
+단순한 네트워크 스니퍼나 CPU 프로파일러를 넘어, **SRE 장애 포렌식 · 클라우드 비용 최적화(FinOps) · 보안 침해 분석 · AI 자율 운영(AIOps) · 아키텍처 벤치마킹**의 3대 영역 11가지 실무 시나리오에 직접 투입할 수 있습니다.
+
+#### [영역 A] SRE 실전 장애 포렌식 및 미스터리 지연 종결 (5대 시나리오)
+1. **쿠버네티스(K8s) 컨테이너 CFS CPU 스로틀링(`cpu.max`)으로 인한 ‘가짜 네트워크 지연’ 규명**:
+   * 패킷은 이미 커널에 도착해 `epoll`이 워커 스레드를 깨웠으나([`sched_wakeup`](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/progs/tracer_l6_sched.bpf.c#L120-L155)), 컨테이너 CPU 쿼터 제한에 걸려 스레드가 런큐에서 수백 ms 동안 잠든 현상을 `L5:SOCKET_RECV` + `L6:PRE_COMPUTE` 결합으로 즉시 입증합니다.
+2. **AI 추론 서버(Python ↔ C++/CUDA/ONNX) 및 JNI/FFI 암호화 경계 병목 진단**:
+   * 파이썬/자바 앱이 호출하는 스트립된 네이티브 공유 라이브러리(`.so`)의 함수를 [daemon/daemon_preflight.h (`resolve_elf_symbol_offset`)](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/daemon/daemon_preflight.h#L155-L246)의 `-b <.so> -s <함수명>`으로 자동 추적하여, 특정 HTTP 요청(`req_id`)의 네이티브 연산 시간(On-CPU)과 스케줄러 선점 시간(Off-CPU)을 분리합니다.
+3. **데이터베이스 & 인메모리 캐시(Redis / PostgreSQL / MySQL / Kafka) 스파이크 해부**:
+   * [kray_proto_dissector.py](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/kray_proto_dissector.py)의 DB 와이어 프로토콜 파서와 [progs/tracer_l5_syscall.bpf.c](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/progs/tracer_l5_syscall.bpf.c)의 블록 I/O(`block_rq_issue`→`complete`) 및 페이지 폴트(`handle_mm_fault`) 훅을 결합하여, DB 응답 지연이 네트워크 드롭 때문인지 디스크 플러시/스왑 스톨 때문인지 DB 재시작 없이 밝혀냅니다.
+4. **외주 솔루션·레거시 블랙박스 바이너리 무수정 감사 (Zero-Code Blackbox Audit)**:
+   * 소스 코드가 없거나 재빌드가 불가능한 상용/레거시 데몬 옆에서 `-m <µs> -c <개수> -d <초>` 옵션으로 임계치를 넘긴 이상 스파이크 패킷만 정확히 캡처하고 자동 탈착합니다.
+5. **멀티테넌트/고집적 클라우드 VM의 ‘이웃 소음(Noisy Neighbor)’ 물리적 입증**:
+   * 내 코드 변경이 없는데도 레이턴시가 튈 때, 호스트의 다른 프로세스에 밀려 발생한 CPU 코어 강제 이동(`Core A -> Core B`)과 디스크 I/O 대기를 캡처하여 인프라팀/클라우드 벤더에 객관적 증거로 제시합니다.
+
+#### [영역 B] 보안 포렌식 · 클라우드 비용 절감(FinOps) · 아키텍처 최적화 (3대 시나리오)
+6. **[클라우드 FinOps] “서버 증설(Scale-Out)이 필요한가, 커널/락 튜닝이 필요한가?” 투자 대비 효과 판별**:
+   * `[VERDICT]` 리포트에서 실제 L7 유저 함수 연산은 `100µs` 미만인데 `L5(sk_rcvbuf)`나 `L6(futex 락 대기)`가 지배적이라면, 값비싼 클라우드 인스턴스를 증설해도 빨라지지 않음을 증명하고 소켓 버퍼(`net.core.rmem_max`)나 락 구조 튜닝으로 불필요한 서버 증설 비용을 절감합니다.
+7. **[보안 침해 사고 & 백도어 포렌식] 외부 패킷(`4-tuple`) ↔ 내부 실행 함수(`fn:0x...`) 1:1 인과 추적**:
+   * TLS 등으로 페이로드가 암호화된 환경에서도, **“어느 외부 IP:Port에서 들어온 패킷(`req_id`)이 프로세스 내부의 어떤 비정상 함수 오프셋(`L7:USER_ENTRY`)과 16단계 콜스택을 트리거했는가”**를 연결하여 원격 코드 실행(RCE) 시도나 비정상 실행 경로를 네트워크 발신지와 함께 특정합니다.
+8. **[고성능 서버 아키텍처 벤치마킹] Thread-per-Request vs Async EventLoop(Reactor) 정량 비교**:
+   * 아키텍처 전환(예: 블로킹 스레드 모델 → 비동기 이벤트 루프 + 워커 풀) 시 단순 RPS만 비교하는 대신, 스레드 핸드오프 비용(`waker_tid -> tid`), `futex` 경합, CPU 캐시 마이그레이션 비용이 실제로 얼마나 줄어들었는지 나노초 단위로 비교 검증합니다.
+
+#### [영역 C] AI 자율 운영(AIOps) · CI/CD 자동 회귀 게이트 · 커널 엔지니어링 실습 (3대 시나리오)
+9. **[AIOps / LLM 에이전트 연동] AI 장애 분석기를 위한 ‘결정론적 커널 근거 데이터(Ground-Truth)’ 제공**:
+   * LLM에게 추상적인 애플리케이션 로그만 주면 환각(Hallucination) 기반의 추측을 내놓지만, `tracer_daemon -j`의 순수 JSON 스트림과 [tracer_agent.py](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/tracer_agent.py)의 AI 진단 파이프라인을 연결하면 **L2~L7 실측 나노초 데이터와 드롭 사유 코드(`kfree_skb`)를 근거로 정확한 `sysctl` 및 코드 패치를 도출**합니다.
+10. **[CI/CD 성능 회귀 자동 게이트] 배포 전 커널 레벨 이상 징후 자동 차단**:
+    * 스테이징 부하 테스트 단계에서 `sudo ./tracer_daemon -p 8080 -j -d 10 | jq` 파이프라인을 실행하여, 응답 시간 평균에 가려진 **신규 페이지 폴트 급증, TCP 재전송, 과도한 스레드 핸드오프**가 발견되면 프로덕션 배포를 자동 중단시킵니다.
+11. **[시스템/네트워크 엔지니어링 교육] 살아있는 리눅스 커널 네트워크 스택 X-Ray 실습장**:
+    * `krayctl proto inspect`(22종 프로토콜 및 IEEE 802 프레임 비트 해부)와 `krayctl verify 1..5 --live`를 통해, 패킷 하나가 NIC 드라이버 → `sk_buff` → TCP 상태 머신 → 소켓 수신 큐 → OS 스케줄러 → 유저 공간 함수로 흐르는 리눅스 커널의 실제 동작을 눈으로 확인하는 실습 플랫폼으로 활용합니다.
+
+---
+
+## 8. 라이선스
 
 이 프로젝트의 eBPF 커널 프로그램 및 호환 레이어는 GNU General Public License v2.0 (GPL-2.0)에 따라 라이선스가 부여됩니다. 사용자 공간 에이전트 및 CLI 도구는 MIT 라이선스를 따릅니다. 자세한 내용은 [LICENSING.md](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/README.md)를 참조하십시오.
 
