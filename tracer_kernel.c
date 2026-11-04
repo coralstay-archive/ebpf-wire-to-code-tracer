@@ -1,10 +1,19 @@
 /*
+ * ==============================================================================
  * eBPF-WireToCode-Tracer — 7-Layer (Wire-to-PreCompute-to-ALU) eBPF Collector
+ * ==============================================================================
  * Target Kernel: Rocky Linux 9.8 (Blue Onyx) aarch64 — 5.14.0-687.10.1.el9_8.0.1.aarch64
- * Grounded in:
- *   1. references/rocky9.8-kernel-5.14.0-687.10.1.el9_8.0.1/ (vmlinux.h, net/ipv4/tcp.c, dev.c, datagram.c)
- *   2. references/ebpf-docs-master/docs/ (XDP, Kprobe, Tracepoint, RingBuf, Verifier)
- *   3. references/BPF-성능-분석-도구.pdf (Ch.6 runqlat, Ch.7 MM, Ch.9 Block I/O, Ch.10.1.4 SoftIRQ PID trap, Ch.12 Symbolication)
+ * Traceable Upstream Grounding & Reference Links:
+ *   1. Kernel BTF & Subsystem Sources: [rocky9.8-kernel-5.14.0-687.10.1.el9_8.0.1](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/references/rocky9.8-kernel-5.14.0-687.10.1.el9_8.0.1/)
+ *      - vmlinux.h, net/ipv4/tcp.c, net/core/dev.c, net/core/datagram.c, kernel/sched/core.c
+ *   2. Upstream Libbpf-Bootstrap & Selftests: [libbpf-bootstrap](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/references/libbpf-bootstrap/examples/c/)
+ *      - minimal.bpf.c, bootstrap.bpf.c, uprobe.bpf.c, tc.bpf.c
+ *   3. Production Incident Hardening & ARM64 Limits: [ebpf-production-postmortems-and-arm64-limits.md](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/README.md)
+ *      - CrowdStrike 2024 boundary checks, Datadog verifier bounds, Cloudflare XDP drops
+ *   4. BPF Performance Tools (Brendan Gregg): [BPF-성능-분석-도구.pdf](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/references/BPF-성능-분석-도구.pdf)
+ *      - Ch.6 runqlat, Ch.7 Memory MM, Ch.9 Block I/O, Ch.10.1.4 SoftIRQ PID trap, Ch.12 Symbolication
+ *   5. CLI Standards & Conventions: [cli-argument-standards-and-conventions.md](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/README.md)
+ * ==============================================================================
  */
 
 #if defined(__aarch64__) || !defined(__x86_64__)
@@ -111,6 +120,10 @@ enum kray_flags_e {
     FLAG_TCP_PSH         = 0x40,
     FLAG_TCP_FIN         = 0x80
 };
+
+#ifndef FLAG_TCP_RST
+#define FLAG_TCP_RST 0x04
+#endif
 
 /* ============================================================================
  * 16-Byte Hot-Reloadable Runtime Configuration Struct (Zero Recompile)
@@ -265,6 +278,30 @@ BPF_LRU_HASH(inflight_bio_map, struct bio_key_t, struct bio_state_t, 4096);
 BPF_RINGBUF_OUTPUT(events, 1 << 16);
 BPF_ARRAY(drop_cnt_map, u64, 1);
 
+struct uprobe_rate_limiter_t {
+    u64 window_start_ns;
+    u32 call_count;
+    u32 throttle_active;
+};
+
+BPF_PERCPU_ARRAY(uprobe_rate_limit_map, struct uprobe_rate_limiter_t, 1);
+BPF_PERCPU_ARRAY(kprobe_recursion_guard, u32, 1);
+
+static __always_inline int kprobe_enter_guard(void) {
+    u32 zero = 0;
+    u32 *val = kprobe_recursion_guard.lookup(&zero);
+    if (!val) return 0;
+    if (*val >= 4) return -1;
+    (*val)++;
+    return 0;
+}
+
+static __always_inline void kprobe_exit_guard(void) {
+    u32 zero = 0;
+    u32 *val = kprobe_recursion_guard.lookup(&zero);
+    if (val && *val > 0) (*val)--;
+}
+
 /* ============================================================================
  * Helper Functions
  * ============================================================================ */
@@ -292,6 +329,7 @@ static __always_inline u8 extract_tcp_flags(struct tcphdr *tcph) {
     if (tcph->ack) flags |= FLAG_TCP_ACK;
     if (tcph->psh) flags |= FLAG_TCP_PSH;
     if (tcph->fin) flags |= FLAG_TCP_FIN;
+    if (tcph->rst) flags |= 0x04; /* FLAG_TCP_RST */
     return flags;
 }
 
@@ -419,6 +457,13 @@ static __always_inline void publish_handoff_slot(
     ring->slots[slot_idx].dport       = dport;
     ring->slots[slot_idx].prev_cpu_id = cpu_id;
     ring->slots[slot_idx].claimed     = 0;
+#if defined(__aarch64__) && !defined(__BPF__) && !defined(KRAY_BPF_CORE)
+    asm volatile("dmb ish" ::: "memory");
+#elif defined(__BPF__) || defined(KRAY_BPF_CORE)
+    barrier();
+#else
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+#endif
     ring->write_idx++;
 }
 
@@ -512,6 +557,21 @@ int xdp_ingress_filter(struct xdp_md *ctx)
     u64 req_id = ((now & 0xFFFFFFFFULL) << 16) ^ ((u64)sport << 4) ^ (u64)dport;
     u32 rx_cpu = bpf_get_smp_processor_id();
     u8 tflags  = extract_tcp_flags(tcph);
+
+    /* TCP RST Immediate Flow Eviction */
+    if (tcph->rst || (tflags & 0x04)) {
+        struct flow_state_t *rst_existing = ingress_flow_map.lookup(&key);
+        if (rst_existing) {
+            u64 rst_req_id = rst_existing->req_id;
+            ingress_flow_map.delete(&key);
+            emit_kray_event(
+                rst_req_id, (u64)((long)data_end - (long)data), now, 10000ULL,
+                0, 0, 0,
+                key.saddr, key.daddr, sport, dport,
+                LAYER_INGRESS_NIC, 0, OSI_L2_DATALINK, tflags | 0x04);
+        }
+        return XDP_PASS;
+    }
 
     struct flow_state_t state = {};
     state.req_id    = req_id;
@@ -709,11 +769,15 @@ int kprobe__ip_rcv(struct pt_regs *ctx, struct sk_buff *skb)
 
 int kprobe__tcp_v4_rcv(struct pt_regs *ctx, struct sk_buff *skb)
 {
+    if (kprobe_enter_guard() < 0)
+        return 0;
 #ifdef KRAY_BPF_CORE
     skb = (struct sk_buff *)PT_REGS_PARM1(ctx);
 #endif
-    if (!skb)
+    if (!skb) {
+        kprobe_exit_guard();
         return 0;
+    }
 
     unsigned char *head = NULL;
     u16 net_off = 0;
@@ -721,8 +785,10 @@ int kprobe__tcp_v4_rcv(struct pt_regs *ctx, struct sk_buff *skb)
     bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
     bpf_probe_read_kernel(&net_off, sizeof(net_off), &skb->network_header);
     bpf_probe_read_kernel(&trans_off, sizeof(trans_off), &skb->transport_header);
-    if (!head)
+    if (!head) {
+        kprobe_exit_guard();
         return 0;
+    }
 
     struct iphdr iph = {};
     struct tcphdr tcph = {};
@@ -732,8 +798,10 @@ int kprobe__tcp_v4_rcv(struct pt_regs *ctx, struct sk_buff *skb)
     u16 sport = bpf_ntohs(tcph.source);
     u16 dport = bpf_ntohs(tcph.dest);
     u16 target_port = get_target_port();
-    if (target_port != 0 && dport != target_port)
+    if (target_port != 0 && dport != target_port) {
+        kprobe_exit_guard();
         return 0;
+    }
 
     struct flow_key_t key = {};
     key.saddr  = iph.saddr;
@@ -745,6 +813,26 @@ int kprobe__tcp_v4_rcv(struct pt_regs *ctx, struct sk_buff *skb)
 
     u64 now = bpf_ktime_get_ns();
     u8 tflags = extract_tcp_flags(&tcph);
+
+    /* TCP RST Immediate Flow Eviction */
+    if (tcph.rst || (tflags & 0x04)) {
+        struct flow_state_t *rst_state = ingress_flow_map.lookup(&key);
+        if (rst_state) {
+            u64 rst_req_id = rst_state->req_id;
+            u64 dur_ns = rst_state->ip_rcv_ts ? (now - rst_state->ip_rcv_ts) : 10000ULL;
+            ingress_flow_map.delete(&key);
+            u16 ihl_bytes = (iph.ihl & 0x0f) * 4;
+            u64 encoded_ip = ((u64)iph.ttl << 24) | ((u64)ihl_bytes << 16) | (u64)rst_state->pkt_len;
+            emit_kray_event(
+                rst_req_id, encoded_ip, now, dur_ns,
+                0, 0, 0,
+                key.saddr, key.daddr, sport, dport,
+                LAYER_KERNEL_NET, 0, OSI_L4_TCP, tflags | 0x04);
+        }
+        kprobe_exit_guard();
+        return 0;
+    }
+
     u16 tot_len = bpf_ntohs(iph.tot_len);
     u16 ihl_len = (iph.ihl & 0x0f) * 4;
     u16 doff_len = (tcph.doff & 0x0f) * 4;
@@ -762,8 +850,10 @@ int kprobe__tcp_v4_rcv(struct pt_regs *ctx, struct sk_buff *skb)
         init_state.consumed  = 0;
         ingress_flow_map.update(&key, &init_state);
         state = ingress_flow_map.lookup(&key);
-        if (!state)
+        if (!state) {
+            kprobe_exit_guard();
             return 0;
+        }
     }
 
     u64 dur_ns = state->ip_rcv_ts ? (now - state->ip_rcv_ts) : 30000ULL;
@@ -777,6 +867,7 @@ int kprobe__tcp_v4_rcv(struct pt_regs *ctx, struct sk_buff *skb)
         0, 0, 0,
         key.saddr, key.daddr, sport, dport,
         LAYER_KERNEL_NET, 0, OSI_L4_TCP, tflags);
+    kprobe_exit_guard();
     return 0;
 }
 
@@ -1557,6 +1648,27 @@ int trace_uprobe_entry(struct pt_regs *ctx)
     u8 raw_depth = tctx->call_depth;
     u64 off_cpu_snap = tctx->acc_off_cpu_ns;
 
+    /* Adaptive Uprobe Rate-Limiting Guard:
+     * Track call rate across 1-second window (1,000,000,000 ns).
+     * If call frequency exceeds 10,000 calls/sec, guard against CPU spike
+     * and application latency collapse by throttling telemetry emission. */
+    u32 zero_rate_idx = 0;
+    bool throttle_uprobe = false;
+    struct uprobe_rate_limiter_t *rate_limiter = uprobe_rate_limit_map.lookup(&zero_rate_idx);
+    if (rate_limiter) {
+        if (now - rate_limiter->window_start_ns >= 1000000000ULL) {
+            rate_limiter->window_start_ns = now;
+            rate_limiter->call_count = 1;
+            rate_limiter->throttle_active = 0;
+        } else {
+            rate_limiter->call_count++;
+            if (rate_limiter->call_count > 10000) {
+                rate_limiter->throttle_active = 1;
+                throttle_uprobe = true;
+            }
+        }
+    }
+
     /*
      * Protect fn_entry_ip[0..15] and fn_entry_ts[0..15] from wrap-around overwrite
      * when recursion / call depth exceeds MAX_CALL_DEPTH (16)!
@@ -1574,12 +1686,14 @@ int trace_uprobe_entry(struct pt_regs *ctx)
     if (tctx->call_depth < 255)
         tctx->call_depth++;
 
-    u8 report_depth = (raw_depth < MAX_CALL_DEPTH) ? raw_depth : (MAX_CALL_DEPTH - 1);
-    emit_kray_event(
-        tctx->req_id, entry_ip, now, off_cpu_snap,
-        tgid, tid, tctx->parent_tid,
-        tctx->saddr, tctx->daddr, tctx->sport, tctx->dport,
-        LAYER_USER_FUNC, 0, report_depth, tctx->flags);
+    if (!throttle_uprobe) {
+        u8 report_depth = (raw_depth < MAX_CALL_DEPTH) ? raw_depth : (MAX_CALL_DEPTH - 1);
+        emit_kray_event(
+            tctx->req_id, entry_ip, now, off_cpu_snap,
+            tgid, tid, tctx->parent_tid,
+            tctx->saddr, tctx->daddr, tctx->sport, tctx->dport,
+            LAYER_USER_FUNC, 0, report_depth, tctx->flags);
+    }
     return 0;
 }
 
@@ -1596,6 +1710,13 @@ int trace_uprobe_return(struct pt_regs *ctx)
     /* Mandatory u8 call_depth underflow guard */
     if (tctx->call_depth == 0)
         return 0;
+
+    u32 zero_rate_idx = 0;
+    struct uprobe_rate_limiter_t *rate_limiter = uprobe_rate_limit_map.lookup(&zero_rate_idx);
+    if (rate_limiter && rate_limiter->throttle_active) {
+        tctx->call_depth--;
+        return 0;
+    }
 
     tctx->call_depth--;
     u8 raw_depth = tctx->call_depth;
@@ -1937,18 +2058,24 @@ int kprobe__ip6_output(struct pt_regs *ctx, struct net *net, struct sock *sk, st
 
 int kprobe__tcp_v6_rcv(struct pt_regs *ctx, struct sk_buff *skb)
 {
+    if (kprobe_enter_guard() < 0)
+        return 0;
 #ifdef KRAY_BPF_CORE
     skb = (struct sk_buff *)PT_REGS_PARM1(ctx);
 #endif
-    if (!skb)
+    if (!skb) {
+        kprobe_exit_guard();
         return 0;
+    }
     unsigned char *head = NULL;
     u16 net_off = 0, trans_off = 0;
     bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
     bpf_probe_read_kernel(&net_off, sizeof(net_off), &skb->network_header);
     bpf_probe_read_kernel(&trans_off, sizeof(trans_off), &skb->transport_header);
-    if (!head)
+    if (!head) {
+        kprobe_exit_guard();
         return 0;
+    }
 
     struct ipv6hdr ip6h = {};
     struct tcphdr tcph = {};
@@ -1958,8 +2085,10 @@ int kprobe__tcp_v6_rcv(struct pt_regs *ctx, struct sk_buff *skb)
     u16 sport = bpf_ntohs(tcph.source);
     u16 dport = bpf_ntohs(tcph.dest);
     u16 target_port = get_target_port();
-    if (target_port != 0 && dport != target_port)
+    if (target_port != 0 && dport != target_port) {
+        kprobe_exit_guard();
         return 0;
+    }
 
     struct flow_key_t key = {};
     key.saddr  = fold_ipv6_addr32(ip6h.saddr.in6_u.u6_addr32);
@@ -1971,6 +2100,23 @@ int kprobe__tcp_v6_rcv(struct pt_regs *ctx, struct sk_buff *skb)
 
     u64 now = bpf_ktime_get_ns();
     u8 tflags = extract_tcp_flags(&tcph);
+
+    /* TCP RST Immediate Flow Eviction */
+    if (tcph.rst || (tflags & 0x04)) {
+        struct flow_state_t *rst_state = ingress_flow_map.lookup(&key);
+        if (rst_state) {
+            u64 rst_req_id = rst_state->req_id;
+            ingress_flow_map.delete(&key);
+            emit_kray_event(
+                rst_req_id, (u64)(bpf_ntohs(ip6h.payload_len) + 40), now, 10000ULL,
+                0, 0, 0,
+                key.saddr, key.daddr, sport, dport,
+                LAYER_KERNEL_NET, 0, OSI_L4_TCP, tflags | 0x04);
+        }
+        kprobe_exit_guard();
+        return 0;
+    }
+
     u16 payload_len = bpf_ntohs(ip6h.payload_len);
     u16 doff_len = (tcph.doff & 0x0f) * 4;
     u16 tcp_payload_len = (payload_len > doff_len) ? (payload_len - doff_len) : 0;
@@ -1986,8 +2132,10 @@ int kprobe__tcp_v6_rcv(struct pt_regs *ctx, struct sk_buff *skb)
         init_state.consumed  = 0;
         ingress_flow_map.update(&key, &init_state);
         state = ingress_flow_map.lookup(&key);
-        if (!state)
+        if (!state) {
+            kprobe_exit_guard();
             return 0;
+        }
     }
 
     state->tcp_rcv_ts = now;
@@ -2000,6 +2148,7 @@ int kprobe__tcp_v6_rcv(struct pt_regs *ctx, struct sk_buff *skb)
         0, 0, 0,
         key.saddr, key.daddr, sport, dport,
         LAYER_KERNEL_NET, 0, OSI_L4_TCP, tflags);
+    kprobe_exit_guard();
     return 0;
 }
 

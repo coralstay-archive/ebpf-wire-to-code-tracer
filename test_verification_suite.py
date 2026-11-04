@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 """
-eBPF-WireToCode-Tracer — 12 Mandatory End-to-End Verification Suite (TDD Red-to-Green)
-Strictly validates TEST-01 through TEST-12 and all 45 Pre-Implementation Design Audit Invariants
-specified in PROMPT_SPEC.md against Rocky Linux 9.8 (5.14.0-687.10.1.el9_8.0.1.aarch64) references.
+================================================================================
+test_verification_suite.py — 24-Suite Master Integration & Architectural Verifier
+================================================================================
+Authoritative References & Standards:
+  - Rocky Linux 9.8 aarch64 Kernel BTF: [rocky9.8-kernel-5.14.0-687.10.1.el9_8.0.1](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/references/rocky9.8-kernel-5.14.0-687.10.1.el9_8.0.1/)
+  - Upstream BPF Selftests: [selftests/bpf](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/references/upstream-kernel-bpf-docs/selftests/)
+  - Libbpf CO-RE Templates: [libbpf-bootstrap](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/references/libbpf-bootstrap/examples/c/)
+  - Production Incident Hardening: [ebpf-production-postmortems-and-arm64-limits.md](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/README.md)
+  - Unified Technical Specification: [README.md](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/README.md)
+
+Strictly validates TEST-01 through TEST-24 and all 45 Pre-Implementation Design Audit Invariants
+specified against Rocky Linux 9.8 (5.14.0-687.10.1.el9_8.0.1.aarch64) references.
+================================================================================
 """
 
 import ctypes
@@ -26,11 +36,8 @@ except ImportError:
     pytest = None
 
 ROOT_DIR = Path(__file__).resolve().parent
-REF_BASE_DIR = (
-    ROOT_DIR / "references"
-    if (ROOT_DIR / "references").exists()
-    else Path("/Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/references")
-)
+# 커널 소스·BTF 참고 자료(references/, .gitignore 대상). 다른 위치에 두었다면 EBPF_REFERENCES_DIR로 지정한다.
+REF_BASE_DIR = Path(os.environ.get("EBPF_REFERENCES_DIR", ROOT_DIR / "references"))
 KERNEL_C_PATH = ROOT_DIR / "tracer_kernel.c"
 AGENT_PY_PATH = ROOT_DIR / "tracer_agent.py"
 MOCK_SERVER_CPP_PATH = ROOT_DIR / "mock_server.cpp"
@@ -779,6 +786,9 @@ def test_10_human_interfaces_web_dashboard_and_tui(tmp_path: Path):
             str(tmp_path / "tui_out"),
             "--ai-report",
             str(tmp_path / "tui_ai.json"),
+            # TUI [7] Export HTML이 저장소 루트의 추적 파일(trace_dashboard.html)을 덮어쓰지 않도록 tmp로 보낸다.
+            "--html-out",
+            str(tmp_path / "tui_dashboard.html"),
         ],
         input="1\n2\n3\n4\n5\n6\n7\nq\n",
         text=True,
@@ -1083,6 +1093,13 @@ def test_12_seven_layer_precompute_matrix_and_multiproto_port_discovery(tmp_path
     for proto in ["tcp", "udp", "ipv4", "ipv6", "icmp", "arp", "unix", "tls"]:
         assert proto in inv["protocols"], f"Missing protocol '{proto}' in discovery inventory"
         assert len(inv["protocols"][proto]["hooks"]) >= 1
+
+    # Verify 22-Protocol Data Frame Dissector & Real Packet Wire Transmission Suite
+    import kray_proto_dissector
+    assert kray_proto_dissector.run_all_15_protocols_test() is True, "22-protocol frame dissector verification failed"
+
+    import test_live_packets
+    assert test_live_packets.run_all_real_packet_tests() is True, "23-real packet wire transmission suite failed"
 
 
 # ==============================================================================
@@ -2138,6 +2155,8 @@ def test_adv_11_visual_artifacts_mermaid_flamegraph_html_and_tui_edge_cases(tmp_
             "--lib", str(LIBCRYPTO_SO),
             "--out", str(tmp_path / "tui_edge"),
             "--ai-report", str(tmp_path / "tui_edge.json"),
+            # 기본 --html-out(현재 디렉터리의 trace_dashboard.html)이 저장소 추적 파일을 덮어쓰지 않도록 tmp로 보낸다.
+            "--html-out", str(tmp_path / "tui_edge_dashboard.html"),
         ],
         input="99\ninvalid_key\n\nm\nf\nq\n",
         capture_output=True,

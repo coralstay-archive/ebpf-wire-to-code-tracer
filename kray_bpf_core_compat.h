@@ -6,6 +6,10 @@
 #ifndef KRAY_BPF_CORE_COMPAT_H
 #define KRAY_BPF_CORE_COMPAT_H
 
+#ifndef barrier
+#define barrier() asm volatile("" ::: "memory")
+#endif
+
 #define tp_args_net_netif_receive_skb_t        struct trace_event_raw_net_dev_template
 #define tp_args_net_net_dev_queue_t            struct trace_event_raw_net_dev_template
 #define tp_args_net_net_dev_xmit_t             struct trace_event_raw_net_dev_xmit

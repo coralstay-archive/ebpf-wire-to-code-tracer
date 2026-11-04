@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""
+================================================================================
+krayctl — eBPF-WireToCode-Tracer Human Operator CLI Tool (Pure Python 3)
+================================================================================
+Modular Package Structure (kray/*):
+  - [kray/__init__.py](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/kray/__init__.py): Constants, ANSI colors & BSD <sysexits.h> codes
+  - [kray/help_docs.py](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/kray/help_docs.py): Manual pages, synopses & operator cheatsheet
+  - [kray/verify_scenarios.py](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/kray/verify_scenarios.py): 5 Real-World I/O & Kernel Verification Scenarios
+  - [kray/host_ops.py](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/kray/host_ops.py): Host-side direct execve (shell=False) runners
+  - [kray/remote_target.py](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/kray/remote_target.py): Target VM native executor (zero .sh scripts)
+================================================================================
+"""
+
+import sys
+from pathlib import Path
+
+# Resolve symlink so krayctl works from ~/.local/bin or /usr/local/bin
+REAL_ROOT = Path(__file__).resolve().parent
+if str(REAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(REAL_ROOT))
+
+from kray import RED, NC, EX_OK, EX_CLI_INVALID_CMD
+from kray.help_docs import (
+    cmd_version, usage, help_status, help_verify, help_test,
+    help_trace, help_proto, help_selftest, help_install, cmd_inspect
+)
+from kray.verify_scenarios import run_verify
+from kray.host_ops import (
+    cmd_status, cmd_sync, cmd_build, cmd_selftest, cmd_trace,
+    cmd_proto, cmd_chaos, cmd_dashboard, cmd_claims, cmd_run_all,
+    cmd_test, cmd_install, cmd_uninstall
+)
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        return usage(EX_OK)
+
+    cmd = argv[0]
+    rest = argv[1:]
+
+    if cmd in ("help", "-h", "--help"):
+        if rest:
+            sub = rest[0]
+            help_dispatch = {
+                "verify": help_verify,
+                "test": help_test,
+                "trace": help_trace,
+                "proto": help_proto,
+                "frame": help_proto,
+                "selftest": help_selftest,
+                "status": help_status,
+                "install": help_install,
+                "uninstall": lambda: cmd_uninstall(["-h"]),
+                "sync": lambda: cmd_sync(["-h"]),
+                "build": lambda: cmd_build(["-h"]),
+                "chaos": lambda: cmd_chaos(["-h"]),
+                "dashboard": lambda: cmd_dashboard(["-h"]),
+                "inspect": lambda: cmd_inspect(["-h"]),
+                "claims": lambda: cmd_claims(["-h"]),
+                "run-all": lambda: cmd_run_all(["-h"]),
+            }
+            if sub in help_dispatch:
+                return help_dispatch[sub]()
+        return usage(EX_OK)
+
+    if cmd in ("-v", "-V", "--version", "version"):
+        return cmd_version()
+
+    dispatch = {
+        "status": cmd_status,
+        "verify": lambda a: run_verify(a, cmd_trace),
+        "test": cmd_test,
+        "sync": cmd_sync,
+        "build": cmd_build,
+        "selftest": cmd_selftest,
+        "trace": cmd_trace,
+        "proto": cmd_proto,
+        "frame": cmd_proto,
+        "chaos": cmd_chaos,
+        "dashboard": cmd_dashboard,
+        "inspect": cmd_inspect,
+        "claims": cmd_claims,
+        "run-all": cmd_run_all,
+        "install": cmd_install,
+        "uninstall": cmd_uninstall,
+    }
+
+    if cmd in dispatch:
+        return dispatch[cmd](rest)
+
+    sys.stderr.write(f"{RED}Error: Unknown command or option '{cmd}'{NC}\n")
+    sys.stderr.write("Try 'krayctl --help' for available commands.\n")
+    return EX_CLI_INVALID_CMD
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,8 +1,31 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
+ * ==============================================================================
  * progs/kray_common.h — Common Header & BPF Map Declarations for Micro-BPF Modules
- * Grounded in Rocky Linux 9.8 aarch64 (5.14.0-687.10.1.el9_8.0.1.aarch64)
- * Modeled after tools/testing/selftests/bpf/progs/
+ * ==============================================================================
+ * Architectural Reference & Upstream Kernel Alignments:
+ *
+ * 1. Linux Upstream Selftests BPF Architecture:
+ *    - Structure & Macro Conventions: [selftests/bpf/progs](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/references/upstream-kernel-bpf-docs/selftests/)
+ *    - Modern CO-RE Helpers: [bpf_core_read.h](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/references/libbpf-bootstrap/examples/c/)
+ *
+ * 2. Target Linux Kernel Sources & Data Structures:
+ *    - Rocky Linux 9.8 aarch64 (5.14.0-687.10.1.el9_8.0.1.aarch64)
+ *    - SKB Definitions & Ingress Paths: [rocky9.8-kernel-5.14.0-687.10.1.el9_8.0.1/net/core/dev.c](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/references/rocky9.8-kernel-5.14.0-687.10.1.el9_8.0.1/)
+ *    - TCP State Engine & Retransmit: [rocky9.8-kernel-5.14.0-687.10.1.el9_8.0.1/net/ipv4/tcp.c](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/references/rocky9.8-kernel-5.14.0-687.10.1.el9_8.0.1/)
+ *    - Scheduler Core & Runqueue: [rocky9.8-kernel-5.14.0-687.10.1.el9_8.0.1/kernel/sched/core.c](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/references/rocky9.8-kernel-5.14.0-687.10.1.el9_8.0.1/)
+ *
+ * 3. Network & Transport Layer RFC / IEEE Standards:
+ *    - IEEE 802.3 (Ethernet) & IEEE 802.1Q / 802.1ad (VLAN QinQ Tagging)
+ *    - RFC 791 (IPv4), RFC 8200 (IPv6), RFC 826 (ARP), RFC 792 (ICMP)
+ *    - RFC 793 (TCP State Machine), RFC 768 (UDP)
+ *
+ * 4. Production Postmortem & ARM64 Architecture Invariants:
+ *    - Reference Specification: [ebpf-production-postmortems-and-arm64-limits.md](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/README.md)
+ *    - 64-Byte Packed Alignment: Zero compiler padding, 1:1 C/Python ctypes ABI stability
+ *    - 8-Slot Lock-Free FIFO Ring: Cross-thread context handoff without kernel mutex locks
+ *    - 16-Slot Shadow Stack: Resolves Uretprobe trampoline IP corruption & 512B BPF stack overflow
+ * ==============================================================================
  */
 #ifndef PROGS_KRAY_COMMON_H
 #define PROGS_KRAY_COMMON_H
@@ -26,6 +49,12 @@
 #include "../kray_bpf_core_compat.h"
 #elif defined(KRAY_USER_SIM)
 #include "../mock_bpf_runtime.h"
+#elif defined(KRAY_USER_DAEMON)
+#include <stdint.h>
+typedef uint8_t  u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
 #else
 #include <uapi/linux/ptrace.h>
 #include <uapi/linux/bpf.h>
@@ -111,6 +140,10 @@ enum kray_flags_e {
     FLAG_TCP_PSH         = 0x40,
     FLAG_TCP_FIN         = 0x80
 };
+
+#ifndef FLAG_TCP_RST
+#define FLAG_TCP_RST 0x04
+#endif
 
 /* 16-Byte Hot-Reloadable Runtime Configuration Struct (Zero Recompile) */
 struct __attribute__((packed)) kray_runtime_cfg_t {
@@ -234,6 +267,7 @@ struct bio_state_t {
     u32 bytes;
 };
 
+#ifndef KRAY_USER_DAEMON
 #ifndef KRAY_COMMON_MAPS_DECLARED
 #define KRAY_COMMON_MAPS_DECLARED
 
@@ -248,6 +282,30 @@ BPF_LRU_HASH(skb_egress_map, u64, struct flow_key_t, 8192);
 BPF_LRU_HASH(inflight_bio_map, struct bio_key_t, struct bio_state_t, 4096);
 BPF_RINGBUF_OUTPUT(events, 1 << 16);
 BPF_ARRAY(drop_cnt_map, u64, 1);
+
+struct uprobe_rate_limiter_t {
+    u64 window_start_ns;
+    u32 call_count;
+    u32 throttle_active;
+};
+
+BPF_PERCPU_ARRAY(uprobe_rate_limit_map, struct uprobe_rate_limiter_t, 1);
+BPF_PERCPU_ARRAY(kprobe_recursion_guard, u32, 1);
+
+static __always_inline int kprobe_enter_guard(void) {
+    u32 zero = 0;
+    u32 *val = kprobe_recursion_guard.lookup(&zero);
+    if (!val) return 0;
+    if (*val >= 4) return -1;
+    (*val)++;
+    return 0;
+}
+
+static __always_inline void kprobe_exit_guard(void) {
+    u32 zero = 0;
+    u32 *val = kprobe_recursion_guard.lookup(&zero);
+    if (val && *val > 0) (*val)--;
+}
 
 static __always_inline u16 get_target_port(void) {
     u32 idx = 0;
@@ -273,6 +331,7 @@ static __always_inline u8 extract_tcp_flags(struct tcphdr *tcph) {
     if (tcph->ack) flags |= FLAG_TCP_ACK;
     if (tcph->psh) flags |= FLAG_TCP_PSH;
     if (tcph->fin) flags |= FLAG_TCP_FIN;
+    if (tcph->rst) flags |= 0x04; /* FLAG_TCP_RST */
     return flags;
 }
 
@@ -392,9 +451,17 @@ static __always_inline void publish_handoff_slot(
     ring->slots[slot_idx].dport       = dport;
     ring->slots[slot_idx].prev_cpu_id = cpu_id;
     ring->slots[slot_idx].claimed     = 0;
+#if defined(__aarch64__) && !defined(__BPF__) && !defined(KRAY_BPF_CORE)
+    asm volatile("dmb ish" ::: "memory");
+#elif defined(__BPF__) || defined(KRAY_BPF_CORE)
+    barrier();
+#else
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+#endif
     ring->write_idx++;
 }
 
 #endif /* KRAY_COMMON_MAPS_DECLARED */
+#endif /* !KRAY_USER_DAEMON */
 
 #endif /* PROGS_KRAY_COMMON_H */

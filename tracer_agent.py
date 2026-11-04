@@ -201,7 +201,7 @@ def compute_final_drop_count(
 def decode_event_metadata(ev: KrayEvent) -> Dict[str, Any]:
     """
     Decode the disjoint (layer_type, call_depth) encoding and bit-packed ev.ip / ev.duration_ns
-    defined in Section 3.1.3 of PROMPT_SPEC.md.
+    defined in Section 3.1.3 of README.md.
     """
     ltype = int(ev.layer_type)
     cdepth = int(ev.call_depth)

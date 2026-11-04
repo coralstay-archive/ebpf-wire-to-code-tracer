@@ -326,7 +326,7 @@
       <h4>1. DWARF C++ Source Evidence (<code>mock_server.cpp</code>)</h4>
       <pre id="cpp-source-view">{
   &quot;execute_storage_query&quot;: {
-    &quot;file&quot;: &quot;/Users/flynn_macpro/githubs/dev-tools/ebpf-wire-to-code-tracer/mock_server.cpp&quot;,
+    &quot;file&quot;: &quot;mock_server.cpp&quot;,
     &quot;line&quot;: 7,
     &quot;function&quot;: &quot;execute_storage_query&quot;,
     &quot;snippet&quot;: &quot;   6 |  *   2. Condition Variable Handoff (TID A -&gt; TID B): std::condition_variable::notify_one()\n   7 |  *   3. Worker Thread (TID B): execute_storage_query (18ms baseline bottleneck vs 1.2ms --fast-storage) -&gt; format_http_response -&gt; send\n   8 |  */\n   9 | \n  10 | #include &lt;arpa/inet.h&gt;\n  11 | #include &lt;dlfcn.h&gt;\n  12 | #include &lt;netinet/in.h&gt;\n  13 | #include &lt;sys/socket.h&gt;\n  14 | #include &lt;unistd.h&gt;\n  15 | \n  16 | #include &lt;chrono&gt;\n  17 | #include &lt;condition_variable&gt;\n  18 | #include &lt;cstdint&gt;\n  19 | #include &lt;cstdio&gt;\n  20 | #include &lt;cstdlib&gt;\n  21 | #include &lt;cstring&gt;\n  22 | #include &lt;mutex&gt;\n  23 | #include &lt;queue&gt;\n  24 | #include &lt;string&gt;\n  25 | #include &lt;thread&gt;&quot;
@@ -335,7 +335,7 @@
       <h4>2. Stripped Shared Library Disassembly (<code>libcrypto_mock.so+0x...</code>)</h4>
       <pre id="asm-source-view">{
   &quot;libcrypto_mock.so+0x538&quot;: {
-    &quot;module&quot;: &quot;/Users/flynn_macpro/githubs/dev-tools/ebpf-wire-to-code-tracer/libcrypto_mock.so&quot;,
+    &quot;module&quot;: &quot;libcrypto_mock.so&quot;,
     &quot;offset&quot;: &quot;0x538&quot;,
     &quot;stripped&quot;: true,
     &quot;instructions&quot;: [
@@ -1089,7 +1089,7 @@
   ],
   "source_code_evidence": {
     "execute_storage_query": {
-      "file": "/Users/flynn_macpro/githubs/dev-tools/ebpf-wire-to-code-tracer/mock_server.cpp",
+      "file": "mock_server.cpp",
       "line": 7,
       "function": "execute_storage_query",
       "snippet": "   6 |  *   2. Condition Variable Handoff (TID A -> TID B): std::condition_variable::notify_one()\n   7 |  *   3. Worker Thread (TID B): execute_storage_query (18ms baseline bottleneck vs 1.2ms --fast-storage) -> format_http_response -> send\n   8 |  */\n   9 | \n  10 | #include <arpa/inet.h>\n  11 | #include <dlfcn.h>\n  12 | #include <netinet/in.h>\n  13 | #include <sys/socket.h>\n  14 | #include <unistd.h>\n  15 | \n  16 | #include <chrono>\n  17 | #include <condition_variable>\n  18 | #include <cstdint>\n  19 | #include <cstdio>\n  20 | #include <cstdlib>\n  21 | #include <cstring>\n  22 | #include <mutex>\n  23 | #include <queue>\n  24 | #include <string>\n  25 | #include <thread>"
@@ -1097,7 +1097,7 @@
   },
   "stripped_assembly_evidence": {
     "libcrypto_mock.so+0x538": {
-      "module": "/Users/flynn_macpro/githubs/dev-tools/ebpf-wire-to-code-tracer/libcrypto_mock.so",
+      "module": "libcrypto_mock.so",
       "offset": "0x538",
       "stripped": true,
       "instructions": [

@@ -9,6 +9,10 @@ CC ?= clang
 CXX ?= clang++
 BPFTOOL ?= /usr/sbin/bpftool
 
+# 원격 테스트 VM: ssh 호스트 별칭과 VM 안의 작업 디렉터리(원격 홈 기준 상대 경로)
+VM_HOST ?= ebpf-vm
+VM_DIR ?= ebpf-wire-to-code-tracer
+
 # Use LLVM Clang with BPF backend support if available (e.g. Homebrew LLVM on macOS or distro clang on Linux)
 CLANG_BPF := $(shell if [ -x "/opt/homebrew/opt/llvm/bin/clang" ]; then echo "/opt/homebrew/opt/llvm/bin/clang"; else which clang; fi)
 
@@ -66,19 +70,32 @@ test: all
 	python3 test_verification_suite.py -v
 
 vmtest:
-	./vmtest.sh
+	./krayctl run-all
 
 vmtest-load:
-	./vmtest.sh -l
+	./krayctl claims
 
 vmtest-skeleton:
-	ssh ebpf-tracer-v2.0.0 bash -c "'cd /home/rocky/ebpf-wire-to-code-tracer-v2.0.0 && clang -target bpf -D__TARGET_ARCH_arm64 -DKRAY_BPF_CORE -O2 -g -I. -Ireferences/rocky9.8-kernel-5.14.0-687.10.1.el9_8.0.1/btf-and-headers -c tracer_kernel.c -o tracer_kernel_bpf.o && bpftool gen skeleton tracer_kernel_bpf.o > tracer_kernel.skel.h && head -n 30 tracer_kernel.skel.h'"
+	./krayctl build
 
 vmtest-progs:
-	ssh ebpf-tracer-v2.0.0 bash -c "'cd /home/rocky/ebpf-wire-to-code-tracer-v2.0.0 && gcc -O2 -g test_progs.c -lbpf -lelf -lz -o test_progs && sudo ./test_progs'"
+	./krayctl selftest
+
+vmtest-trace:
+	./krayctl trace
+
+vmtest-daemon:
+	./krayctl trace
+
+install:
+	./krayctl install
+
+uninstall:
+	./krayctl uninstall
 
 clean:
 	rm -f tracer_kernel_bpf.o tracer_kernel.skel.h
 	rm -f libcrypto_mock.so mock_server
 	rm -f libtracer_kernel_sim.dylib libtracer_kernel_sim.so
+	rm -f test_progs tracer_daemon progs/*.skel.h progs/*.o
 	rm -rf *.dSYM .pytest_cache __pycache__

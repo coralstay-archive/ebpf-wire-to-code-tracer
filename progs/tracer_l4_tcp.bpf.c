@@ -1,11 +1,17 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
+ * ==============================================================================
  * progs/tracer_l4_tcp.bpf.c — Layer 4 TCP/UDP/AF_UNIX Transport & Forensics
- * Grounded in Rocky Linux 9.8 aarch64 (5.14.0-687.10.1.el9_8.0.1.aarch64)
- * References:
- *   - references/bcc-libbpf-tools/libbpf-tools/tcpconnect.bpf.c
- *   - references/bcc-libbpf-tools/libbpf-tools/tcprtt.bpf.c
- *   - references/bcc-libbpf-tools/libbpf-tools/tcpretrans.bpf.c
+ * ==============================================================================
+ * Upstream References & RFC Standards:
+ *   - BCC Libbpf Tools: [tcpconnect.bpf.c](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/references/bcc-libbpf-tools/libbpf-tools/tcpconnect.bpf.c), [tcpretrans.bpf.c](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/references/bcc-libbpf-tools/libbpf-tools/tcpretrans.bpf.c)
+ *   - Kernel TCP State Machine: [rocky9.8-kernel-5.14.0-687.10.1.el9_8.0.1/net/ipv4/tcp.c](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/references/rocky9.8-kernel-5.14.0-687.10.1.el9_8.0.1/)
+ *   - RFC 793 (Transmission Control Protocol), RFC 768 (User Datagram Protocol)
+ *   - Defensive Hardening: [ebpf-production-postmortems-and-arm64-limits.md](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/README.md)
+ *     * SYN Epoch Rollover (Dynamic Ephemeral Port Reuse)
+ *     * RST Immediate Eviction (Lingering State Elimination)
+ *     * kfree_skb Drop Reason Code Interception
+ * ==============================================================================
  */
 
 #include "kray_common.h"
@@ -13,11 +19,15 @@
 SEC("kprobe/tcp_v4_rcv")
 int kprobe__tcp_v4_rcv(struct pt_regs *ctx, struct sk_buff *skb)
 {
+    if (kprobe_enter_guard() < 0)
+        return 0;
 #ifdef KRAY_BPF_CORE
     skb = (struct sk_buff *)PT_REGS_PARM1(ctx);
 #endif
-    if (!skb)
+    if (!skb) {
+        kprobe_exit_guard();
         return 0;
+    }
 
     unsigned char *head = NULL;
     u16 net_off = 0;
@@ -25,8 +35,10 @@ int kprobe__tcp_v4_rcv(struct pt_regs *ctx, struct sk_buff *skb)
     bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
     bpf_probe_read_kernel(&net_off, sizeof(net_off), &skb->network_header);
     bpf_probe_read_kernel(&trans_off, sizeof(trans_off), &skb->transport_header);
-    if (!head)
+    if (!head) {
+        kprobe_exit_guard();
         return 0;
+    }
 
     struct iphdr iph = {};
     struct tcphdr tcph = {};
@@ -36,8 +48,10 @@ int kprobe__tcp_v4_rcv(struct pt_regs *ctx, struct sk_buff *skb)
     u16 sport = bpf_ntohs(tcph.source);
     u16 dport = bpf_ntohs(tcph.dest);
     u16 target_port = get_target_port();
-    if (target_port != 0 && dport != target_port)
+    if (target_port != 0 && dport != target_port) {
+        kprobe_exit_guard();
         return 0;
+    }
 
     struct flow_key_t key = {};
     key.saddr  = iph.saddr;
@@ -49,6 +63,26 @@ int kprobe__tcp_v4_rcv(struct pt_regs *ctx, struct sk_buff *skb)
 
     u64 now = bpf_ktime_get_ns();
     u8 tflags = extract_tcp_flags(&tcph);
+
+    /* TCP RST Immediate Flow Eviction */
+    if (tcph.rst || (tflags & 0x04)) {
+        struct flow_state_t *rst_state = ingress_flow_map.lookup(&key);
+        if (rst_state) {
+            u64 rst_req_id = rst_state->req_id;
+            u64 dur_ns = rst_state->ip_rcv_ts ? (now - rst_state->ip_rcv_ts) : 10000ULL;
+            ingress_flow_map.delete(&key);
+            u16 ihl_bytes = (iph.ihl & 0x0f) * 4;
+            u64 encoded_ip = ((u64)iph.ttl << 24) | ((u64)ihl_bytes << 16) | (u64)rst_state->pkt_len;
+            emit_kray_event(
+                rst_req_id, encoded_ip, now, dur_ns,
+                0, 0, 0,
+                key.saddr, key.daddr, sport, dport,
+                LAYER_KERNEL_NET, 0, OSI_L4_TCP, tflags | 0x04);
+        }
+        kprobe_exit_guard();
+        return 0;
+    }
+
     u16 tot_len = bpf_ntohs(iph.tot_len);
     u16 ihl_len = (iph.ihl & 0x0f) * 4;
     u16 doff_len = (tcph.doff & 0x0f) * 4;
@@ -65,8 +99,10 @@ int kprobe__tcp_v4_rcv(struct pt_regs *ctx, struct sk_buff *skb)
         init_state.consumed  = 0;
         ingress_flow_map.update(&key, &init_state);
         state = ingress_flow_map.lookup(&key);
-        if (!state)
+        if (!state) {
+            kprobe_exit_guard();
             return 0;
+        }
     }
 
     u64 dur_ns = state->ip_rcv_ts ? (now - state->ip_rcv_ts) : 30000ULL;
@@ -80,24 +116,31 @@ int kprobe__tcp_v4_rcv(struct pt_regs *ctx, struct sk_buff *skb)
         0, 0, 0,
         key.saddr, key.daddr, sport, dport,
         LAYER_KERNEL_NET, 0, OSI_L4_TCP, tflags);
+    kprobe_exit_guard();
     return 0;
 }
 
 SEC("kprobe/tcp_v6_rcv")
 int kprobe__tcp_v6_rcv(struct pt_regs *ctx, struct sk_buff *skb)
 {
+    if (kprobe_enter_guard() < 0)
+        return 0;
 #ifdef KRAY_BPF_CORE
     skb = (struct sk_buff *)PT_REGS_PARM1(ctx);
 #endif
-    if (!skb)
+    if (!skb) {
+        kprobe_exit_guard();
         return 0;
+    }
     unsigned char *head = NULL;
     u16 net_off = 0, trans_off = 0;
     bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
     bpf_probe_read_kernel(&net_off, sizeof(net_off), &skb->network_header);
     bpf_probe_read_kernel(&trans_off, sizeof(trans_off), &skb->transport_header);
-    if (!head)
+    if (!head) {
+        kprobe_exit_guard();
         return 0;
+    }
 
     struct ipv6hdr ip6h = {};
     struct tcphdr tcph = {};
@@ -107,8 +150,10 @@ int kprobe__tcp_v6_rcv(struct pt_regs *ctx, struct sk_buff *skb)
     u16 sport = bpf_ntohs(tcph.source);
     u16 dport = bpf_ntohs(tcph.dest);
     u16 target_port = get_target_port();
-    if (target_port != 0 && dport != target_port)
+    if (target_port != 0 && dport != target_port) {
+        kprobe_exit_guard();
         return 0;
+    }
 
     struct flow_key_t key = {};
     key.saddr  = fold_ipv6_addr32(ip6h.saddr.in6_u.u6_addr32);
@@ -120,6 +165,23 @@ int kprobe__tcp_v6_rcv(struct pt_regs *ctx, struct sk_buff *skb)
 
     u64 now = bpf_ktime_get_ns();
     u8 tflags = extract_tcp_flags(&tcph);
+
+    /* TCP RST Immediate Flow Eviction */
+    if (tcph.rst || (tflags & 0x04)) {
+        struct flow_state_t *rst_state = ingress_flow_map.lookup(&key);
+        if (rst_state) {
+            u64 rst_req_id = rst_state->req_id;
+            ingress_flow_map.delete(&key);
+            emit_kray_event(
+                rst_req_id, (u64)(bpf_ntohs(ip6h.payload_len) + 40), now, 10000ULL,
+                0, 0, 0,
+                key.saddr, key.daddr, sport, dport,
+                LAYER_KERNEL_NET, 0, OSI_L4_TCP, tflags | 0x04);
+        }
+        kprobe_exit_guard();
+        return 0;
+    }
+
     u16 payload_len = bpf_ntohs(ip6h.payload_len);
     u16 doff_len = (tcph.doff & 0x0f) * 4;
     u16 tcp_payload_len = (payload_len > doff_len) ? (payload_len - doff_len) : 0;
@@ -135,8 +197,10 @@ int kprobe__tcp_v6_rcv(struct pt_regs *ctx, struct sk_buff *skb)
         init_state.consumed  = 0;
         ingress_flow_map.update(&key, &init_state);
         state = ingress_flow_map.lookup(&key);
-        if (!state)
+        if (!state) {
+            kprobe_exit_guard();
             return 0;
+        }
     }
 
     state->tcp_rcv_ts = now;
@@ -149,6 +213,7 @@ int kprobe__tcp_v6_rcv(struct pt_regs *ctx, struct sk_buff *skb)
         0, 0, 0,
         key.saddr, key.daddr, sport, dport,
         LAYER_KERNEL_NET, 0, OSI_L4_TCP, tflags);
+    kprobe_exit_guard();
     return 0;
 }
 

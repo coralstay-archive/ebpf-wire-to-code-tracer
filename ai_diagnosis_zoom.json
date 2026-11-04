@@ -170,7 +170,7 @@
   ],
   "source_code_evidence": {
     "execute_storage_query": {
-      "file": "/Users/flynn_macpro/githubs/dev-tools/ebpf-wire-to-code-tracer/mock_server.cpp",
+      "file": "mock_server.cpp",
       "line": 7,
       "function": "execute_storage_query",
       "snippet": "   6 |  *   2. Condition Variable Handoff (TID A -> TID B): std::condition_variable::notify_one()\n   7 |  *   3. Worker Thread (TID B): execute_storage_query (18ms baseline bottleneck vs 1.2ms --fast-storage) -> format_http_response -> send\n   8 |  */\n   9 | \n  10 | #include <arpa/inet.h>\n  11 | #include <dlfcn.h>\n  12 | #include <netinet/in.h>\n  13 | #include <sys/socket.h>\n  14 | #include <unistd.h>\n  15 | \n  16 | #include <chrono>\n  17 | #include <condition_variable>\n  18 | #include <cstdint>\n  19 | #include <cstdio>\n  20 | #include <cstdlib>\n  21 | #include <cstring>\n  22 | #include <mutex>\n  23 | #include <queue>\n  24 | #include <string>\n  25 | #include <thread>"
@@ -178,7 +178,7 @@
   },
   "stripped_assembly_evidence": {
     "libcrypto_mock.so+0x538": {
-      "module": "/Users/flynn_macpro/githubs/dev-tools/ebpf-wire-to-code-tracer/libcrypto_mock.so",
+      "module": "libcrypto_mock.so",
       "offset": "0x538",
       "stripped": true,
       "instructions": [

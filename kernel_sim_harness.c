@@ -24,6 +24,8 @@ void sim_reset_all(void)
     memset(__sim_store_inflight_bio_map, 0, sizeof(__sim_store_inflight_bio_map));
     memset(__sim_rb_buf_events, 0, sizeof(__sim_rb_buf_events));
     memset(__sim_arr_drop_cnt_map, 0, sizeof(__sim_arr_drop_cnt_map));
+    memset(__sim_percpu_arr_uprobe_rate_limit_map, 0, sizeof(__sim_percpu_arr_uprobe_rate_limit_map));
+    memset(__sim_percpu_arr_kprobe_recursion_guard, 0, sizeof(__sim_percpu_arr_kprobe_recursion_guard));
 
     __sim_cap_ingress_flow_map    = 8192;
     __sim_cap_active_ctx_map      = 8192;
@@ -1044,4 +1046,30 @@ int sim_epoll_pwait_cycle(u32 tgid, u32 tid, int ret, u64 wait_ns)
         g_sim_clock_ns += wait_ns;
     tp_args_syscalls_sys_exit_epoll_pwait_t exit_args = { .id = 22, .ret = ret };
     return tracepoint__syscalls__sys_exit_epoll_pwait(&exit_args);
+}
+
+int sim_tcp_v4_rst_packet(u32 saddr, u32 daddr, u16 sport, u16 dport)
+{
+    u8 pkt[512];
+    u16 net_off = 0, trans_off = 0, total_len = 0;
+    build_ipv4_tcp_buf(pkt, saddr, daddr, sport, dport, 5, 0, 0, 0, 0, 0, &net_off, &trans_off, &total_len);
+    struct tcphdr *tcph = (struct tcphdr *)(pkt + trans_off);
+    tcph->rst = 1;
+
+    struct sk_buff skb = {};
+    skb.head             = pkt;
+    skb.data             = pkt + net_off;
+    skb.network_header   = net_off;
+    skb.transport_header = trans_off;
+    skb.len              = total_len - net_off;
+
+    struct pt_regs regs = {};
+    return kprobe__tcp_v4_rcv(&regs, &skb);
+}
+
+int sim_get_uprobe_rate_limit_throttled(void)
+{
+    u32 zero = 0;
+    struct uprobe_rate_limiter_t *limiter = __sim_percpu_lookup_uprobe_rate_limit_map(&zero);
+    return limiter ? limiter->throttle_active : 0;
 }

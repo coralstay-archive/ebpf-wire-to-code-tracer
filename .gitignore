@@ -1,5 +1,6 @@
 # Reference materials (large PDFs, kernel source trees, external docs)
-/references/
+/references/*
+!/references/*.md
 
 # Python & C/BPF build artifacts
 __pycache__/
@@ -28,3 +29,7 @@ mock_server
 # BPF 빌드 산출물 (make로 다시 생성)
 *.bpf.o
 *.skel.h
+
+# 공개 저장소 제외 (TASK-18, 2026-11-01)
+# 에이전트 보고서·서브에이전트 프롬프트·.agents 초안(로컬 경로·VM 정보·세션 ID 포함)은 로컬에만 둔다.
+/archive/

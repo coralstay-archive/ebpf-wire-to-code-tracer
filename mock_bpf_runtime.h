@@ -28,6 +28,10 @@ typedef uint64_t __u64;
 #define __always_inline inline __attribute__((always_inline))
 #endif
 
+#ifndef barrier
+#define barrier() asm volatile("" ::: "memory")
+#endif
+
 static inline u16 bpf_ntohs(u16 v) { return __builtin_bswap16(v); }
 static inline u16 bpf_htons(u16 v) { return __builtin_bswap16(v); }
 static inline u32 bpf_ntohl(u32 v) { return __builtin_bswap32(v); }

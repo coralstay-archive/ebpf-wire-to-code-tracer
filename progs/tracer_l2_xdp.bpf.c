@@ -1,11 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
+ * ==============================================================================
  * progs/tracer_l2_xdp.bpf.c — Layer 2 NIC DMA / XDP & Netif Ingress Telemetry
- * Grounded in Rocky Linux 9.8 aarch64 (5.14.0-687.10.1.el9_8.0.1.aarch64)
- * References:
- *   - tools/testing/selftests/bpf/progs/test_xdp_vlan.c
- *   - references/xdp-tutorial/packet01-parsing/
- *   - references/bcc-libbpf-tools/libbpf-tools/softirqs.bpf.c
+ * ==============================================================================
+ * Upstream References & RFC Standards:
+ *   - Upstream XDP Parser Pattern: [references/xdp-tutorial/packet01-parsing](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/references/xdp-tutorial/packet01-parsing/)
+ *   - Upstream Selftest VLAN: [test_xdp_vlan.c](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/references/upstream-kernel-bpf-docs/selftests/)
+ *   - Kernel Netif Ingress: [rocky9.8-kernel-5.14.0-687.10.1.el9_8.0.1/net/core/dev.c](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/references/rocky9.8-kernel-5.14.0-687.10.1.el9_8.0.1/)
+ *   - IEEE 802.3 (Ethernet MAC) & IEEE 802.1Q / 802.1ad (VLAN Tagging 0x8100, 0x88A8, 0x9100)
+ *   - Defensive Hardening: [ebpf-production-postmortems-and-arm64-limits.md](file:///Users/flynn_macpro/githubs/ebpf-wire-to-code-tracer/README.md) (Incident 1 & 3)
+ * ==============================================================================
  */
 
 #include "kray_common.h"
@@ -97,6 +101,21 @@ int xdp_ingress_filter(struct xdp_md *ctx)
     u64 req_id = ((now & 0xFFFFFFFFULL) << 16) ^ ((u64)sport << 4) ^ (u64)dport;
     u32 rx_cpu = bpf_get_smp_processor_id();
     u8 tflags  = extract_tcp_flags(tcph);
+
+    /* TCP RST Immediate Flow Eviction */
+    if (tcph->rst || (tflags & 0x04)) {
+        struct flow_state_t *rst_existing = ingress_flow_map.lookup(&key);
+        if (rst_existing) {
+            u64 rst_req_id = rst_existing->req_id;
+            ingress_flow_map.delete(&key);
+            emit_kray_event(
+                rst_req_id, (u64)((long)data_end - (long)data), now, 10000ULL,
+                0, 0, 0,
+                key.saddr, key.daddr, sport, dport,
+                LAYER_INGRESS_NIC, 0, OSI_L2_DATALINK, tflags | 0x04);
+        }
+        return XDP_PASS;
+    }
 
     struct flow_state_t state = {};
     state.req_id    = req_id;
